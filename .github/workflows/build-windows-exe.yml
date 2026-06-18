@@ -1,0 +1,87 @@
+name: Build piiscrub (Windows EXE)
+
+# Automated Windows build of the piiscrub CLI. No local build needed:
+#   - Push to any branch                  -> builds, uploads the .exe artifact
+#   - "Run workflow" button               -> build on demand
+#   - Push a tag  v*                       -> build + publish a Release with the
+#     .exe attached as a single downloadable file.
+#
+# The finished EXE is always available from the run's "Artifacts" section.
+# Pattern adapted from the working qsys-plugin-encryptor build.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["**"]
+    tags:
+      - "v*"
+
+permissions:
+  contents: write          # needed to create a Release on tag pushes
+
+concurrency:
+  group: build-piiscrub-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run tests
+        run: python -m pytest -q
+
+      - name: Build EXE (PyInstaller)
+        run: pyinstaller --noconfirm --clean packaging/piiscrub.spec
+
+      - name: Verify the EXE was produced
+        shell: pwsh
+        run: |
+          $exe = "dist/piiscrub.exe"
+          if (-not (Test-Path $exe)) { throw "Build did not produce $exe" }
+          Get-Item $exe | Format-List Name, Length, LastWriteTime
+
+      - name: Self-test the frozen EXE
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath "dist/piiscrub.exe" `
+                 -ArgumentList "--selftest" -Wait -PassThru
+          if ($p.ExitCode -ne 0) {
+            throw "Self-test failed (exit $($p.ExitCode)) - the frozen exe is broken"
+          }
+          Write-Host "Self-test OK."
+
+      - name: Upload EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: piiscrub-windows-exe
+          path: dist/piiscrub.exe
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Publish Release (tag pushes only)
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}          # via env, never inlined into the script
+        run: |
+          gh release create "$env:TAG" `
+            "dist/piiscrub.exe" `
+            --title "piiscrub $env:TAG" `
+            --notes "Automated Windows build. Download piiscrub.exe below. If SmartScreen warns on first run: right-click the .exe -> Properties -> Unblock -> OK."

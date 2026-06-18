@@ -1,0 +1,4 @@
+# Runtime: stdlib only — nothing here on purpose.
+# Build/dev tooling for the Windows .exe and tests:
+pyinstaller>=6.0
+pytest>=7
