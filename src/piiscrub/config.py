@@ -27,6 +27,10 @@ class Config:
     exclude: list[str] = field(default_factory=list)
     max_bytes: int = DEFAULT_MAX_BYTES
     stream_threshold: int = DEFAULT_STREAM_THRESHOLD
+    # Optional [llm] table. CLI flags override these. ``enabled`` only takes
+    # effect if the operator also passes --llm (the flag is the explicit
+    # opt-in); the config can set provider/endpoint/model defaults.
+    llm: dict = field(default_factory=dict)
 
     @property
     def allowlist_cf(self) -> frozenset[str]:
@@ -71,6 +75,12 @@ def _merge_raw(base: dict, overlay: dict) -> dict:
         out["max_bytes"] = overlay["max_bytes"]
     if "stream_threshold" in overlay:
         out["stream_threshold"] = overlay["stream_threshold"]
+    # [llm] table: merge key-by-key, overlay wins (so a project toml can refine
+    # a profile's llm defaults without clobbering the rest).
+    bllm = dict(base.get("llm", {}) or {})
+    bllm.update(dict(overlay.get("llm", {}) or {}))
+    if bllm:
+        out["llm"] = bllm
     return out
 
 
@@ -87,6 +97,7 @@ def _config_from_raw(raw: dict) -> Config:
         exclude=list(raw.get("exclude", []) or []),
         max_bytes=int(raw.get("max_bytes", DEFAULT_MAX_BYTES)),
         stream_threshold=int(raw.get("stream_threshold", DEFAULT_STREAM_THRESHOLD)),
+        llm=dict(raw.get("llm", {}) or {}),
     )
 
 
