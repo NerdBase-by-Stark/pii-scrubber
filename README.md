@@ -52,6 +52,7 @@ PYTHONPATH=src python -m piiscrub scan ./logs
 | `strip SRC DST` | Writes a stripped mirror into `DST`; writes the decode map + report + chain-of-custody manifest into `SRC/_pii/` (or the project vault); then **auto-runs verify**. |
 | `verify DST` | Re-scans a stripped tree for residual PII shapes and stray sidecars. **Fail-closed** — exits `10` on any finding. |
 | `reverse IN OUT --map M` | Rehydrates aliases in `IN` back to originals using a decode map, writing `OUT`. |
+| `reconcile IN OUT --project P` | Rewrites an already-stripped tree to current canonical aliases (e.g. `<IP_1>` → `<DEV0001.IP_1>`) and writes a **new** output tree. Custody-safe: the input is never modified. |
 | `--selftest` | Compiles every detector and runs a tiny tokenise → reverse → re-scan round-trip; exits `0` on success. CI uses this to prove a frozen `.exe` actually runs. |
 
 ### Exit codes
