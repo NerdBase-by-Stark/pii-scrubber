@@ -1,0 +1,4 @@
+id,type,pretty_name,identifiers,notes
+core-switch-alpha,device,Core Switch Alpha,10.0.0.5;SRV-AB12;de:ad:be:ef:00:11,core switch
+admin-jane,person,Jane (admin),jane@example.com;jdoe,primary admin
+edge-fw-1,device,Edge Firewall 1,10.0.0.1;FW-EDGE-01,perimeter

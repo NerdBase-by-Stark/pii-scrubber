@@ -1,0 +1,36 @@
+# Example piiscrub config. Pass with:  piiscrub strip ./logs ./clean --config examples/piiscrub.toml
+#
+# All keys are optional. CLI flags merge on top of this file.
+# NOTE: in TOML, top-level keys (include/exclude/allowlist/denylist/max_bytes)
+# MUST appear BEFORE any [table] or [[array]] header — keep them at the top.
+
+# Glob filters (relative POSIX paths). include = [] means "all files".
+include = []          # e.g. ["*.log", "logs/**"]
+exclude = []          # e.g. ["*.min.js", "vendor/**"]
+
+# Literal values that must NEVER be tokenised (left as-is in output):
+allowlist = ["pool.ntp.org", "vendor.example.com"]
+
+# Literal values that must ALWAYS be tokenised (case-insensitive):
+denylist = ["ProjectFalcon"]
+
+# Skip files larger than this many bytes (copied through + flagged). Default 200 MB.
+# max_bytes = 209715200
+
+[detectors]
+# Turn built-in categories off (they are on by default):
+disable = []          # e.g. ["credit_card", "fqdn"]
+# Turn opt-in (FP-heavy) categories on:
+enable  = []          # e.g. ["phone"]
+
+# Operator-defined patterns. These get top priority over generic built-ins,
+# so a specific hostname/asset scheme wins. Keep [[custom]] blocks LAST.
+[[custom]]
+name  = "asset_tag"
+type  = "regex"        # "regex" or "literal"
+value = "ASSET-[0-9]{6}"
+
+[[custom]]
+name  = "internal_host"
+type  = "regex"
+value = "[a-z]{2,}\\d{2,}\\.example\\.com"

@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+
+# PyInstaller build output
+build/
+dist/
+*.spec.bak
+
+# Vendored / fetched binaries (never commit)
+vendor/
+
+# PII sidecars — NEVER commit a decode map or report
+_pii/
+decode.json
+*_decode.json
+
+# OS
+.DS_Store
+Thumbs.db
