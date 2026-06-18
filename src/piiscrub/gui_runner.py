@@ -271,8 +271,11 @@ def run_strip(opts: RunOptions, progress: ProgressCallback | None = None) -> dic
             decode_loc = str(pii_dir / "decode.json")
             lock_warn = _lock_dir(pii_dir)
 
+        entities_rows = None
         if opts.emit_entities:
-            entities_mod.write_starter_csv(amap, pii_dir / "entities_starter.csv")
+            entities_rows = entities_mod.write_starter_csv(
+                amap, pii_dir / "entities_starter.csv"
+            )
 
         out: dict = {
             "mode": "strip",
@@ -292,6 +295,7 @@ def run_strip(opts: RunOptions, progress: ProgressCallback | None = None) -> dic
             out["warning"] = lock_warn
         if opts.emit_entities:
             out["entities_starter"] = str(pii_dir / "entities_starter.csv")
+            out["entities_rows"] = entities_rows
         return out
     finally:
         if vault is not None:

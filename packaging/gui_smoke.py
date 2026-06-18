@@ -18,11 +18,16 @@ def main() -> int:
     (tmp / "sample.log").write_text("user a@example.com from 10.0.0.5\n", encoding="utf-8")
     w._source_edit.setText(str(tmp))
     w._start_scan()
-    deadline = 200  # ~4s at 20ms
-    while deadline > 0 and w._report_path is None:
+    # Poll until the worker thread has FULLY shut down (_on_thread_finished sets
+    # _thread = None), not merely until _report_path is set — otherwise we could
+    # exit the process while the QThread is still tearing down. Generous timeout
+    # for loaded CI runners.
+    deadline = 500  # ~10s at 20ms
+    while deadline > 0 and w._thread is not None:
         app.processEvents()
         time.sleep(0.02)
         deadline -= 1
+    assert w._thread is None, "worker thread did not finish shutting down in time"
     assert w._report_path is not None, "scan did not complete via the worker thread"
     print("gui smoke OK")
     return 0

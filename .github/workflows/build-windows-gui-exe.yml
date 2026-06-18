@@ -34,6 +34,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          # The build never runs git commands; the release step uses GH_TOKEN
+          # (gh CLI), not git creds — so don't persist credentials into .git.
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v6

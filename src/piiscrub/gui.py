@@ -345,7 +345,10 @@ class MainWindow(QMainWindow):
 
     @Slot(dict)
     def _on_done(self, result: dict) -> None:
-        self._set_inputs_enabled(True)
+        # Inputs are re-enabled in _on_thread_finished (after the worker thread
+        # has fully shut down), NOT here: re-enabling before `finished` fires
+        # would let a fast re-click start a new run whose refs the OLD thread's
+        # finished handler then nulls (orphaning the new worker).
         self._progress_bar.setRange(0, 1)
         self._progress_bar.setValue(1)
 
@@ -382,7 +385,8 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _on_failed(self, msg: str) -> None:
-        self._set_inputs_enabled(True)
+        # Inputs re-enabled in _on_thread_finished (see _on_done) once the thread
+        # has fully shut down.
         self._progress_bar.setRange(0, 1)
         self._progress_bar.setValue(0)
         # Explicit color: QSS color firewall — must set color when setting any style
@@ -395,8 +399,12 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _on_thread_finished(self) -> None:
+        # Fires after the worker thread has fully shut down. Drop the stale refs
+        # and ONLY NOW re-enable the inputs, so the next run can't overlap a
+        # still-finishing thread.
         self._thread = None
         self._worker = None
+        self._set_inputs_enabled(True)
 
     # ---- Open report -------------------------------------------------------
 

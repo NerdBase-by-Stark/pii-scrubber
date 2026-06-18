@@ -175,3 +175,19 @@ def test_run_scan_emit_entities(tmp_path):
     assert result.get("entities_starter") == str(starter)
     body = starter.read_text(encoding="utf-8")
     assert body.splitlines()[0].startswith("id,type,pretty_name,identifiers,notes")
+
+
+def test_run_strip_emit_entities_returns_rows(tmp_path):
+    """emit_entities=True on strip writes the starter CSV AND returns both
+    entities_starter and entities_rows (matches the run_strip docstring)."""
+    src = tmp_path / "src"
+    _write(src / "a.log", "host db1.internal.example.com ip 192.0.2.10\n")
+
+    opts = RunOptions(source=str(src), target=str(tmp_path / "dst"), emit_entities=True)
+    result = run_strip(opts)
+
+    starter = src / "_pii" / "entities_starter.csv"
+    assert starter.is_file()
+    assert result.get("entities_starter") == str(starter)
+    assert isinstance(result.get("entities_rows"), int)
+    assert result["entities_rows"] >= 1
