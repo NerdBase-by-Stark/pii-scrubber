@@ -1,6 +1,6 @@
 import pytest
 
-from piiscrub.detectors import build_active
+from piiscrub.detectors import BUILTIN_DETECTORS, build_active
 from piiscrub.engine import AliasMap, tokenize
 
 
@@ -60,3 +60,16 @@ def test_custom_pattern_high_priority():
 def test_jwt_detected():
     jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"  # gitleaks:allow (synthetic jwt.io example token, not a real secret)
     assert "jwt" in cats(f"token {jwt} end")
+
+
+# --------------------------------------------------------------------------
+# README "Features" section claims "16+ built-in detectors".
+# --------------------------------------------------------------------------
+
+def test_builtin_detector_count_at_least_16():
+    """README Features section states '16+ built-in detectors'.
+    Verify the actual count in BUILTIN_DETECTORS matches that claim."""
+    assert len(BUILTIN_DETECTORS) >= 16, (
+        f"README documents 16+ built-in detectors, but only {len(BUILTIN_DETECTORS)} "
+        "are defined in BUILTIN_DETECTORS"
+    )
