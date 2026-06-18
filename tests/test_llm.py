@@ -124,7 +124,7 @@ def test_second_pass_unit_validation(monkeypatch):
     assert count == 1                          # only SECRET-7 survives validation
     assert "SECRET-7" not in new_text
     assert "<IP_1>" in new_text                # existing alias untouched
-    assert "GHOST" not in text                 # never present, ignored
+    assert "GHOST" not in new_text             # absent candidate not introduced into output
 
 
 # --------------------------------------------------------------------------
