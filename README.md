@@ -13,9 +13,45 @@ for many log types. **Stdlib-only at runtime** (needs Python 3.11+ for
 `tomllib`); no third-party dependencies, so the optional Windows `.exe` stays
 small and low-AV-risk.
 
-> **Local-only by design.** This tool never makes network calls. The decode map,
+> **Local-only by design.** Core scan/strip make **no network calls.** The only
+> exception is the optional, off-by-default `--llm` second pass, which defaults to
+> a **local** model and **hard-gates** any non-local endpoint behind `--allow-cloud`
+> (without it a remote endpoint is refused and nothing is sent). The decode map,
 > the `_pii/` sidecar, and any project vault contain the real PII and must
 > **never** be committed or shared. See [SECURITY.md](SECURITY.md).
+
+---
+
+## Features
+
+- **One reversible alias map** — the same real value always maps to the same opaque
+  alias (`<IP_7>`, `<EMAIL_3>`) across every file in a run, so analysts keep
+  correlation without seeing real values; fully reversible from the decode map.
+- **16+ built-in detectors** — IPv4/IPv6, MAC, email, URL, FQDN/hostname, UUID, JWT,
+  AWS/Google API keys, Bearer tokens, PEM private-key blocks, Luhn-checked credit
+  cards, Windows user paths, Windows SIDs (phone opt-in). Single-pass,
+  priority-ordered, overlap-safe — a URL never becomes a tangle of nested aliases.
+- **Custom rules + profiles** — `piiscrub.toml` (custom regex/literal patterns,
+  allow/deny lists, detector toggles, include/exclude globs) and named profiles
+  (`generic`, `network-gear`, `syslog`, `windows-logs`, `pcap-text`).
+- **Cross-run project vault** — one alias map shared across runs, vendors, dates and
+  log types, so the same value correlates across an entire investigation.
+- **Entity grouping** — link a thing's identifiers (IP + hostname + MAC) into one
+  entity-scoped alias (`<DEV0001.IP_1>`); late-arriving identifiers **supersede**
+  earlier plain aliases without breaking old outputs.
+- **`reconcile`** — converge already-delivered stripped trees onto the current
+  canonical aliases, custody-safe (writes a new copy + manifest; original untouched).
+- **Chain-of-custody manifest** — SHA-256 of every original and stripped file, a
+  tamper-evident run digest, and an append-only project audit log.
+- **Fail-closed verify** — every `strip` re-scans its own output for residual PII
+  (exit `10`); a standalone `verify` does the same on demand.
+- **Optional LLM second pass** — off by default; flags residual PII the regex missed,
+  reading only the **already-stripped** text. Local model by default, cloud endpoints
+  hard-gated, API key by env-var only. See below.
+- **Robust file handling** — encoding/BOM detection, binary passthrough, adaptive
+  streaming for multi-GB files (output byte-identical to whole-file), progress bar.
+- **CLI *and* GUI** — a stdlib-only CLI plus an optional PySide6 folder-picker GUI;
+  both ship as portable Windows `.exe`s built in CI.
 
 ---
 
@@ -61,6 +97,7 @@ PYTHONPATH=src python -m piiscrub scan ./logs
 |------|---------|
 | `0` | Success (and, for `verify` / the auto-verify in `strip`, the tree is clean). |
 | `10` | `verify` found residual PII or a stray decode/report sidecar (also returned by `strip` if its auto-verify fails). |
+| `11` | `strip --llm --llm-strict` — the optional LLM second pass hit an error and strict (fail-closed) mode was on. |
 | `3` | Project vault is locked by another run (a stale `.lock` can be removed manually). |
 | `1` | Other operational error (missing file, bad value, bad config key). |
 | `2` | No command given (prints help). |
@@ -239,7 +276,9 @@ plain alias on an earlier run, and you later add it to an entity, the tool marks
 the old plain alias as `superseded_by` the new entity-scoped alias and records
 the equivalence (`supersedes`). Aliases are immutable — an old alias is never
 re-pointed to a different value — so previously stripped outputs still reverse
-correctly.
+correctly. To converge those already-delivered outputs onto the new
+entity-scoped aliases, run [`reconcile`](#commands) (it writes a fresh,
+custody-safe copy and never touches the original).
 
 **Starter CSV.** Run `scan --emit-entities` (or `strip --emit-entities`) to get
 a starter `entities_starter.csv` listing every detected IP / host / MAC / email
@@ -314,6 +353,46 @@ is stored under `runs/<timestamp>/`.
 Format extractors for archives/structured binaries (evtx/xlsx/zip) remain on the
 backlog — see
 [`docs/plans/2026-06-18-pii-scrubber-design.md`](docs/plans/2026-06-18-pii-scrubber-design.md).
+
+---
+
+## Optional LLM second pass (`--llm`)
+
+A second, **opt-in** pass can flag residual PII the regex detectors missed. It runs
+only when you pass `--llm` (a stray config can never start it), and it is built so
+nothing leaks:
+
+* **Already-stripped text only** — the model sees the regex-stripped output, never
+  the raw input.
+* **Local by default, cloud hard-gated** — defaults to a local model (e.g. Ollama at
+  `http://127.0.0.1:11434`). A non-loopback endpoint is **refused** unless you pass
+  `--allow-cloud`; without it nothing leaves the machine.
+* **Flag-only** — the model only returns candidate substrings; the tool validates
+  each against the actual text (rejecting ones that aren't really present, or that
+  are already aliases) and tokenises the survivors into new `<LLM_n>` aliases with
+  the same alias-safe engine. The model's raw output is never trusted as the result.
+* **Key from env-var only** — read from the variable named by `--llm-key-env`
+  (default `PIISCRUB_LLM_KEY`), never a flag value; `--forget-key` scrubs it from the
+  process environment after the run. Local providers need no key.
+* **Fail-open, or fail-closed on demand** — on an LLM error the regex result is kept
+  and a warning printed; `--llm-strict` instead exits `11`.
+* **Stdlib HTTP, TLS, no redirects, temperature 0** — no third-party dependencies.
+
+```bash
+# Local model (default provider/endpoint), no key needed:
+piiscrub strip ./logs ./clean --llm
+
+# A remote endpoint must be explicitly allowed; the key comes from an env var:
+export MY_LLM_KEY=...                       # never passed as a flag
+piiscrub strip ./logs ./clean --llm \
+    --llm-provider openai --llm-endpoint https://api.example.com/v1 \
+    --llm-model some-model --allow-cloud --llm-key-env MY_LLM_KEY --forget-key
+```
+
+Streamed huge files (over `--stream-threshold`) skip the LLM pass and stay
+regex-only; this is noted in the report. Flags: `--llm-provider {ollama,openai,anthropic}`,
+`--llm-endpoint URL`, `--llm-model NAME`, `--llm-key-env VAR`, `--allow-cloud`,
+`--forget-key`, `--llm-strict`.
 
 ---
 
