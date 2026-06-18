@@ -218,6 +218,69 @@ stdout:
 
 ---
 
+## Example 5 — Reconcile a delivered tree to current canonical aliases (`reconcile`)
+
+**Scenario.** You stripped a set of logs and delivered the output. Later you
+grouped `10.0.0.5` into an entity (`core-sw`) so its alias in the vault is now
+canonically `<DEV0001.IP_1>`. The delivered tree still says `<IP_1>`. Use
+`reconcile` to produce a new, updated copy — without modifying the original
+delivered tree.
+
+```bash
+# The delivered tree (read-only, never touched by reconcile)
+# out-syslog/app.log  contains  … <IP_1> …
+
+piiscrub reconcile ./out-syslog ./out-syslog-v2 --project ./case42
+```
+
+Sample stdout:
+
+```json
+{
+  "mode": "reconcile",
+  "files_processed": 12,
+  "files_copied_unprocessed": 1,
+  "replacements": 48,
+  "aliases_reconciled": 2,
+  "manifest": "/.../out-syslog-v2/_pii/manifest.json",
+  "reconcile_map": "/.../out-syslog-v2/_pii/reconcile_map.json",
+  "run_digest": "4e9a12b7..."
+}
+```
+
+`reconcile` writes three custody files under `out-syslog-v2/_pii/`:
+
+| File | Contents |
+|------|----------|
+| `manifest.json` | SHA-256 of every source and output file + run digest |
+| `reconcile_report.json` | Summary: counts, supersession map, warnings |
+| `reconcile_map.json` | `{old_alias: canonical_alias}` applied in this run |
+
+The `_pii/` directory of the **input** tree is never copied into the
+reconciled output (the sidecar is excluded by design).
+
+### With a standalone map file
+
+If you do not have a project vault, pass the map directly:
+
+```bash
+piiscrub reconcile ./out-syslog ./out-syslog-v2 --map ./decode-or-vault-map.json
+```
+
+`--map` accepts either a vault `map.json` or a standalone `decode.json`.
+
+### Reversing a reconciled file
+
+Because the vault map still contains `<IP_1>` (aliases are immutable), a
+reconciled file can still be reversed through the vault map:
+
+```bash
+piiscrub reverse ./out-syslog-v2/app.log ./app.restored.log \
+  --map ./case42/map.json
+```
+
+---
+
 ## Verifying an existing stripped tree
 
 You can re-run the fail-closed residual-PII check on any stripped tree at any

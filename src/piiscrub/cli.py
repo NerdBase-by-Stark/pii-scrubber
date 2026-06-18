@@ -26,6 +26,7 @@ from . import manifest as manifest_mod
 from .profiles import profile_names
 from .progress import make_cli_renderer
 from .projectmap import Vault, VaultLocked
+from . import reconcile as reconcile_mod
 from .report import build_summary, write_html, write_json
 from .walker import process_tree
 
@@ -354,6 +355,86 @@ def cmd_reverse(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_reconcile(args: argparse.Namespace) -> int:
+    input_path = Path(args.input).resolve()
+    output_path = Path(args.output).resolve()
+    if not input_path.is_dir():
+        raise SystemExit(f"error: input not a directory: {input_path}")
+    _guard_containment(input_path, output_path)
+
+    # Resolve map source: --map takes priority when both given.
+    if not getattr(args, "map", None) and not getattr(args, "project", None):
+        raise SystemExit("error: reconcile needs --map or --project")
+
+    if output_path.exists() and output_path.is_dir() and any(output_path.iterdir()):
+        raise SystemExit(
+            f"error: output dir is not empty: {output_path}; reconcile writes a fresh "
+            "custody-tracked copy — use a new/empty output dir"
+        )
+
+    vault = None
+    try:
+        if getattr(args, "map", None):
+            map_path = Path(args.map).resolve()
+        else:
+            vault = Vault(Path(args.project)).open()
+            map_path = vault.map_path
+
+        if not map_path.is_file():
+            raise SystemExit(f"error: map not found: {map_path}")
+
+        try:
+            table = reconcile_mod.load_alias_table(map_path)
+        except json.JSONDecodeError as e:
+            raise SystemExit(f"error: map file is not valid JSON: {map_path}: {e}")
+        canonical_map = reconcile_mod.build_canonical_map(table)
+
+        output_path.mkdir(parents=True, exist_ok=True)
+        ts = _now()
+
+        stats = reconcile_mod.reconcile_tree(
+            input_path, output_path, canonical_map,
+            exclude_dirs={PII_DIRNAME},
+        )
+
+        manifest = manifest_mod.build_manifest(
+            input_path, output_path, stats, timestamp=ts, version=__version__,
+        )
+        summary = reconcile_mod.build_reconcile_summary(
+            src=input_path, dst=output_path, timestamp=ts, version=__version__,
+            stats=stats, canonical_map=canonical_map,
+            run_digest=manifest["run_digest_sha256"],
+        )
+
+        pii_dir = output_path / PII_DIRNAME
+        pii_dir.mkdir(parents=True, exist_ok=True)
+        manifest_mod.write_manifest(manifest, pii_dir / "manifest.json")
+        write_json(summary, pii_dir / "reconcile_report.json")
+        write_json(canonical_map, pii_dir / "reconcile_map.json")
+
+        if vault is not None:
+            run_dir = vault.run_dir(ts)
+            manifest_mod.write_manifest(manifest, run_dir / "manifest.json")
+            write_json(summary, run_dir / "reconcile_report.json")
+            manifest_mod.append_manifest_log(manifest, vault.root / "manifest_log.jsonl")
+
+        out = {
+            "mode": "reconcile",
+            "files_processed": stats.files_processed,
+            "files_copied_unprocessed": stats.files_copied,
+            "replacements": stats.replacements,
+            "aliases_reconciled": len(canonical_map),
+            "manifest": str(pii_dir / "manifest.json"),
+            "reconcile_map": str(pii_dir / "reconcile_map.json"),
+            "run_digest": manifest["run_digest_sha256"],
+        }
+        print(json.dumps(out, indent=2))
+        return 0
+    finally:
+        if vault is not None:
+            vault.close()
+
+
 def _selftest() -> int:
     from .engine import AliasMap, reverse_text, tokenize
     detectors = build_active()
@@ -433,6 +514,17 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("input"); s.add_argument("output")
     s.add_argument("--map", required=True, help="path to decode.json or vault map.json")
     s.set_defaults(func=cmd_reverse)
+
+    s = sub.add_parser(
+        "reconcile",
+        help="rewrite an already-stripped tree to current canonical aliases (custody-safe new copy)",
+    )
+    s.add_argument("input", help="path to the already-stripped input tree")
+    s.add_argument("output", help="path to write the reconciled output tree (new directory)")
+    s.add_argument("--map", help="path to vault map.json or standalone decode.json")
+    s.add_argument("--project", help="vault dir — alternative source for the alias map")
+    s.set_defaults(func=cmd_reconcile)
+
     return p
 
 
