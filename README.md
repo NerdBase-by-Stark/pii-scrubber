@@ -1,5 +1,7 @@
 # piiscrub
 
+![CodeRabbit Pull Request Reviews](https://img.shields.io/coderabbit/prs/github/NerdBase-by-Stark/pii-scrubber?utm_source=oss&utm_medium=github&utm_campaign=NerdBase-by-Stark%2Fpii-scrubber&labelColor=171717&color=FF570A&link=https%3A%2F%2Fcoderabbit.ai&label=CodeRabbit+Reviews)
+
 Reusable, **local-only** PII pseudonymiser for log and text trees. Point it at a
 folder; it writes stripped copies into a new folder and keeps the decode map with
 the originals. The same real value always maps to the same opaque alias
