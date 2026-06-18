@@ -570,3 +570,168 @@ def test_low6_cloud_warning_once_per_run(monkeypatch, tmp_path):
     # the EXTERNAL-service warning appears exactly once across the whole run
     warns = [s for s in captured if "EXTERNAL" in s]
     assert len(warns) == 1
+
+
+# ==========================================================================
+# README DOCUMENTATION REGRESSION TESTS
+# The following tests validate behaviours that were explicitly documented in
+# the README as part of the "Optional LLM second pass" section and the exit
+# code table.  They ensure the documented API matches the implementation.
+# ==========================================================================
+
+# --------------------------------------------------------------------------
+# Exit code 11: README states "strip --llm --llm-strict" exits 11 on error.
+# --------------------------------------------------------------------------
+
+def test_llm_strict_exit_code_is_exactly_11(monkeypatch, tmp_path):
+    """README exit-code table: exit 11 = strip --llm --llm-strict hit an LLM
+    error. The test verifies the EXACT value 11 (not merely non-zero)."""
+    src = tmp_path / "src"
+    _write(src / "a.log", "ip 10.0.0.5\n")
+    dst = tmp_path / "dst"
+
+    def _boom(url, headers, payload, timeout):
+        raise llm_mod.LLMError("simulated failure")
+
+    monkeypatch.setattr(llm_mod, "_http_post", _boom)
+    rc = main(["strip", str(src), str(dst), "--llm", "--llm-strict", "--no-progress"])
+    assert rc == 11, f"README documents exit 11 for --llm-strict failure, got {rc}"
+
+
+def test_llm_strict_exit_code_11_multiple_files(monkeypatch, tmp_path):
+    """Exit code 11 is returned even when multiple files are processed and only
+    one triggers an LLM error (regression: must not be shadowed by the verify
+    pass or any other exit path)."""
+    src = tmp_path / "src"
+    _write(src / "a.log", "ip 10.0.0.1\n")
+    _write(src / "b.log", "ip 10.0.0.2\n")
+    dst = tmp_path / "dst"
+
+    call_count = {"n": 0}
+
+    def _fail_second(url, headers, payload, timeout):
+        call_count["n"] += 1
+        if call_count["n"] >= 2:
+            raise llm_mod.LLMError("second file fails")
+        return _ollama_resp("NONE")
+
+    monkeypatch.setattr(llm_mod, "_http_post", _fail_second)
+    rc = main(["strip", str(src), str(dst), "--llm", "--llm-strict", "--no-progress"])
+    assert rc == 11
+
+
+# --------------------------------------------------------------------------
+# All eight LLM flags documented in the README must exist in the CLI parser.
+# README: --llm, --llm-provider, --llm-endpoint, --llm-model, --llm-key-env,
+#         --allow-cloud, --forget-key, --llm-strict
+# --------------------------------------------------------------------------
+
+def test_all_documented_llm_flags_exist_in_parser():
+    """Every flag listed in the README's 'Optional LLM second pass' section
+    must be recognised by the argument parser."""
+    from piiscrub.cli import build_parser
+
+    parser = build_parser()
+    # parse a strip command with every documented flag; this must not raise.
+    # Use a fake source/dest so the parser accepts them.
+    args = parser.parse_args([
+        "strip", "/tmp/src", "/tmp/dst",
+        "--llm",
+        "--llm-provider", "ollama",
+        "--llm-endpoint", "http://127.0.0.1:11434",
+        "--llm-model", "llama3",
+        "--llm-key-env", "MY_KEY_VAR",
+        "--allow-cloud",
+        "--forget-key",
+        "--llm-strict",
+    ])
+    assert args.llm is True
+    assert args.llm_provider == "ollama"
+    assert args.llm_endpoint == "http://127.0.0.1:11434"
+    assert args.llm_model == "llama3"
+    assert args.llm_key_env == "MY_KEY_VAR"
+    assert args.allow_cloud is True
+    assert args.forget_key is True
+    assert args.llm_strict is True
+
+
+def test_llm_providers_documented_choices_accepted():
+    """README documents three providers: ollama, openai, anthropic.
+    All must be accepted by --llm-provider; an undocumented value must be
+    rejected."""
+    from piiscrub.cli import build_parser
+    import argparse
+
+    parser = build_parser()
+    for provider in ("ollama", "openai", "anthropic"):
+        args = parser.parse_args(["strip", "/s", "/d", "--llm",
+                                  "--llm-provider", provider])
+        assert args.llm_provider == provider
+
+    # An undocumented provider must be rejected.
+    try:
+        parser.parse_args(["strip", "/s", "/d", "--llm",
+                           "--llm-provider", "nonexistent_provider"])
+        raise AssertionError("expected an error for unknown provider")
+    except (SystemExit, argparse.ArgumentError):
+        pass
+
+
+# --------------------------------------------------------------------------
+# Streamed files skip the LLM pass (documented in the README).
+# "Streamed huge files (over --stream-threshold) skip the LLM pass."
+# --------------------------------------------------------------------------
+
+def test_streamed_file_skips_llm_pass(monkeypatch, tmp_path):
+    """Files processed via adaptive streaming (i.e. size > stream_threshold)
+    must not invoke the LLM; the README states they 'stay regex-only'."""
+    src = tmp_path / "src"
+    # Write a file large enough to exceed our artificially low threshold.
+    content = ("ip 10.0.0.99 user test@example.com " * 100) + "\n"
+    _write(src / "big.log", content)
+    dst = tmp_path / "dst"
+
+    rec = _Recorder(_ollama_resp("NONE"))
+    monkeypatch.setattr(llm_mod, "_http_post", rec)
+
+    # stream_threshold set well below the file size so streaming kicks in.
+    file_size = (src / "big.log").stat().st_size
+    threshold = file_size // 2
+
+    rc = main(["strip", str(src), str(dst),
+               "--llm", "--stream-threshold", str(threshold),
+               "--no-progress"])
+    assert rc == 0
+    # The LLM must NOT have been called for the streamed file.
+    assert rec.calls == [], (
+        "LLM must not be called for files processed via adaptive streaming"
+    )
+    # Regex aliases must still be present in the output.
+    out = (dst / "big.log").read_text(encoding="utf-8")
+    assert "<IP_1>" in out
+
+
+# --------------------------------------------------------------------------
+# Local provider is the default — no --allow-cloud needed.
+# README: "defaults to a local model (e.g. Ollama at http://127.0.0.1:11434)"
+# --------------------------------------------------------------------------
+
+def test_local_default_provider_needs_no_allow_cloud(monkeypatch, tmp_path):
+    """When no --llm-endpoint is given, the default local Ollama endpoint is
+    used and the run must succeed without --allow-cloud."""
+    src = tmp_path / "src"
+    _write(src / "a.log", "ip 10.0.0.5\n")
+    dst = tmp_path / "dst"
+
+    rec = _Recorder(_ollama_resp("NONE"))
+    monkeypatch.setattr(llm_mod, "_http_post", rec)
+
+    # No --allow-cloud flag — should be fine for the local default.
+    rc = main(["strip", str(src), str(dst), "--llm", "--no-progress"])
+    assert rc == 0
+    assert rec.calls, "local default provider should have been called"
+    # Verify the call went to a local endpoint.
+    url = rec.calls[0]["url"]
+    assert llm_mod.is_local_endpoint(url), (
+        f"default provider endpoint must be local, got: {url}"
+    )
