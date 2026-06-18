@@ -224,15 +224,22 @@ def _prefix_from_name(name: str) -> str:
 
 
 # (category, prefix) used to classify a lone identifier from the entity table.
-_CLASSIFY_ORDER = ["ipv4", "ipv6", "mac", "email", "uuid"]
+_CLASSIFY_ORDER = ["ipv4", "ipv6", "mac", "email", "uuid", "url", "fqdn"]
 _CLASSIFY_PREFIX = {"ipv4": "IP", "ipv6": "IPV6", "mac": "MAC",
-                    "email": "EMAIL", "uuid": "UUID"}
+                    "email": "EMAIL", "uuid": "UUID",
+                    "url": "URL", "fqdn": "HOST"}
 
 
 def classify_identifier(value: str) -> tuple[str, str]:
     """Infer (category, alias_prefix) for a single operator-supplied identifier.
-    Falls back to host-like (covers bare hostnames such as ``SRV-AB12`` that
-    have no TLD and so don't match the FQDN detector)."""
+
+    Recognises: ``ipv4`` → ``<IP_n>``, ``ipv6`` → ``<IPV6_n>``,
+    ``mac`` → ``<MAC_n>``, ``email`` → ``<EMAIL_n>``, ``uuid`` → ``<UUID_n>``,
+    ``url`` → ``<URL_n>`` (must begin with http/https/ftp scheme),
+    ``fqdn`` → ``<HOST_n>`` (must contain a recognised TLD).
+
+    Falls back to ``("host", "HOST")`` for bare hostnames such as ``SRV-AB12``
+    that carry no TLD and therefore don't match the FQDN detector."""
     by_cat = {d.category: d for d in BUILTIN_DETECTORS}
     for cat in _CLASSIFY_ORDER:
         det = by_cat.get(cat)

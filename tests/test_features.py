@@ -148,3 +148,89 @@ def test_emit_starter_entities(tmp_path, capsys):
     body = starter.read_text(encoding="utf-8")
     assert "db1.internal.corp" in body and "10.4.4.4" in body
     assert body.splitlines()[0].startswith("id,type,pretty_name,identifiers,notes")
+
+
+# ---- FQDN / URL entity supersession ------------------------------------
+
+def test_classify_identifier_recognises_fqdn_and_url():
+    from piiscrub.detectors import classify_identifier
+    assert classify_identifier("node-alpha.example.com") == ("fqdn", "HOST")
+    assert classify_identifier("https://api.example.com/v1") == ("url", "URL")
+    assert classify_identifier("SRV-AB12") == ("host", "HOST")   # bare, no TLD
+    assert classify_identifier("10.0.0.5") == ("ipv4", "IP")     # unchanged
+
+
+def test_late_arriving_entity_supersedes_fqdn(tmp_path):
+    """An FQDN seen plain on run 1 must be superseded when the operator later
+    groups it into an entity, and old outputs must still reverse correctly."""
+    project = tmp_path / "vault"
+    # run 1: no entity table -> plain <HOST_1>
+    src1 = tmp_path / "run1"
+    _write(src1 / "a.log", "host node-alpha.example.com seen")
+    out1 = tmp_path / "out1"
+    main(["strip", str(src1), str(out1), "--project", str(project)])
+    assert "<HOST_1>" in (out1 / "a.log").read_text(encoding="utf-8")
+
+    # operator groups the FQDN into an entity
+    (project / "entities.csv").write_text(
+        "id,type,pretty_name,identifiers,notes\n"
+        "dev0001,device,Node Alpha,node-alpha.example.com,late\n",
+        encoding="utf-8",
+    )
+
+    # run 2: same FQDN resolves to the entity alias
+    src2 = tmp_path / "run2"
+    _write(src2 / "b.log", "host node-alpha.example.com again")
+    out2 = tmp_path / "out2"
+    main(["strip", str(src2), str(out2), "--project", str(project)])
+    new_out = (out2 / "b.log").read_text(encoding="utf-8")
+    assert "<DEV0001.HOST_1>" in new_out
+
+    # vault records the supersession
+    vault_map = json.loads((project / "map.json").read_text())
+    assert vault_map["entries"]["<HOST_1>"]["superseded_by"] == "<DEV0001.HOST_1>"
+    legend = json.loads((project / "legend.json").read_text())
+    assert "<HOST_1>" in legend["DEV0001"]["superseded_aliases"]
+
+    # CRITICAL custody: old output (still using <HOST_1>) must still reverse
+    restored = tmp_path / "r1.log"
+    main(["reverse", str(out1 / "a.log"), str(restored), "--map", str(project / "map.json")])
+    assert "node-alpha.example.com" in restored.read_text(encoding="utf-8")
+
+
+def test_late_arriving_entity_supersedes_url(tmp_path):
+    """A URL seen plain on run 1 must be superseded when grouped into an entity,
+    and old outputs must still reverse correctly."""
+    project = tmp_path / "vault"
+    # run 1: no entity table -> plain <URL_1>
+    src1 = tmp_path / "run1"
+    _write(src1 / "a.log", "endpoint https://api.example.com/v1 called")
+    out1 = tmp_path / "out1"
+    main(["strip", str(src1), str(out1), "--project", str(project)])
+    assert "<URL_1>" in (out1 / "a.log").read_text(encoding="utf-8")
+
+    # operator groups the URL into an entity
+    (project / "entities.csv").write_text(
+        "id,type,pretty_name,identifiers,notes\n"
+        "dev0001,device,API Service,https://api.example.com/v1,late\n",
+        encoding="utf-8",
+    )
+
+    # run 2: same URL resolves to the entity alias
+    src2 = tmp_path / "run2"
+    _write(src2 / "b.log", "endpoint https://api.example.com/v1 again")
+    out2 = tmp_path / "out2"
+    main(["strip", str(src2), str(out2), "--project", str(project)])
+    new_out = (out2 / "b.log").read_text(encoding="utf-8")
+    assert "<DEV0001.URL_1>" in new_out
+
+    # vault records the supersession
+    vault_map = json.loads((project / "map.json").read_text())
+    assert vault_map["entries"]["<URL_1>"]["superseded_by"] == "<DEV0001.URL_1>"
+    legend = json.loads((project / "legend.json").read_text())
+    assert "<URL_1>" in legend["DEV0001"]["superseded_aliases"]
+
+    # CRITICAL custody: old output (still using <URL_1>) must still reverse
+    restored = tmp_path / "r1.log"
+    main(["reverse", str(out1 / "a.log"), str(restored), "--map", str(project / "map.json")])
+    assert "https://api.example.com/v1" in restored.read_text(encoding="utf-8")
