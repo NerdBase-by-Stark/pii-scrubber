@@ -18,8 +18,10 @@ from __future__ import annotations
 import codecs
 import fnmatch
 import shutil
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 from .engine import AliasMap, tokenize, tokenize_segment
 from .detectors import Detector
@@ -293,6 +295,7 @@ def process_tree(
     exclude_dirs: set[str],
     stream_threshold: int = 50 * 1024 * 1024,
     progress: ProgressCallback | None = None,
+    post_pass: Callable[[str, str], tuple[str, int]] | None = None,
 ) -> RunStats:
     """Walk ``src``; tokenise text files into ``dst`` (when ``write``).
 
@@ -309,6 +312,13 @@ def process_tree(
     cumulative byte count (``bytes_done`` advances monotonically toward
     ``bytes_total`` across the whole run, not per file); streamed huge files are
     additionally called per chunk with the same cumulative byte accounting.
+
+    ``post_pass`` (if given) is an OPTIONAL second pass applied ONLY to
+    whole-file processed text AFTER the regex tokenize and BEFORE writing. It is
+    called as ``post_pass(rel, stripped_text) -> (new_text, extra_replacements)``
+    and runs on the already-stripped text, never on raw input. Streamed huge
+    files SKIP the post-pass (a warning is emitted) because the streaming path
+    commits incrementally; v1 leaves them regex-only.
     """
     include = include or []
     exclude = exclude or []
@@ -396,6 +406,15 @@ def process_tree(
                 bytes_done_total += size
                 _emit(rel)
                 continue
+            if post_pass is not None:
+                warnings.warn(
+                    f"{rel}: streamed (> {stream_threshold} bytes); LLM second "
+                    f"pass skipped for this file (regex-only)",
+                    RuntimeWarning, stacklevel=2,
+                )
+                stats.warnings.append(
+                    f"{rel}: streamed huge file; LLM second pass skipped (regex-only)"
+                )
             fs = FileStat(rel, "processed", encoding=enc, replacements=n)
             stats.per_file.append(fs)
             stats.files_processed += 1
@@ -420,10 +439,16 @@ def process_tree(
 
         text, enc = decoded
         new_text, reps = tokenize(text, detectors, amap, allowlist_cf, file=rel)
-        fs = FileStat(rel, "processed", encoding=enc, replacements=len(reps))
+        rep_count = len(reps)
+        # Optional second pass: runs on the ALREADY-STRIPPED text (``new_text``),
+        # never on raw ``text``. Adds extra aliases via the shared amap.
+        if post_pass is not None:
+            new_text, extra = post_pass(rel, new_text)
+            rep_count += extra
+        fs = FileStat(rel, "processed", encoding=enc, replacements=rep_count)
         stats.per_file.append(fs)
         stats.files_processed += 1
-        stats.replacements += len(reps)
+        stats.replacements += rep_count
         if write and out_path is not None:
             out_path.parent.mkdir(parents=True, exist_ok=True)
             with open(out_path, "w", encoding=enc, newline="") as fh:

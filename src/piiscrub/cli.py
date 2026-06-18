@@ -21,6 +21,7 @@ from .config import Config, resolve_config
 from .detectors import build_active
 from .engine import AliasMap
 from . import entities as entities_mod
+from . import llm as llm_mod
 from . import manifest as manifest_mod
 from .profiles import profile_names
 from .progress import make_cli_renderer
@@ -62,6 +63,39 @@ def _resolve(args: argparse.Namespace) -> Config:
     cfg = resolve_config(getattr(args, "profile", None),
                          Path(args.config) if getattr(args, "config", None) else None)
     return _merge_cli_into_config(cfg, args)
+
+
+def _build_provider_cfg(cfg: Config, args: argparse.Namespace) -> llm_mod.ProviderCfg:
+    """Layer the [llm] config table under the CLI flags (flags win). The key is
+    NEVER taken from here — only the NAME of the env var holding it."""
+    table = dict(cfg.llm or {})
+    provider = getattr(args, "llm_provider", None) or table.get("provider") or "ollama"
+    endpoint = getattr(args, "llm_endpoint", None) or table.get("endpoint") or ""
+    model = getattr(args, "llm_model", None) or table.get("model") or ""
+    key_env = getattr(args, "llm_key_env", None) or table.get("key_env") or "PIISCRUB_LLM_KEY"
+    return llm_mod.ProviderCfg(
+        provider=provider,
+        endpoint=endpoint,
+        model=model,
+        key_env=key_env,
+        allow_cloud=bool(getattr(args, "allow_cloud", False)),
+        strict=bool(getattr(args, "llm_strict", False)),
+        forget_key=bool(getattr(args, "forget_key", False)),
+    )
+
+
+def _llm_enabled(cfg: Config, args: argparse.Namespace) -> bool:
+    """The LLM pass runs ONLY when the explicit --llm flag is present. A config
+    [llm].enabled=true alone is NOT enough — the flag is the deliberate opt-in,
+    so a stray config can never silently start calling a model."""
+    return bool(getattr(args, "llm", False))
+
+
+def _forget_key_now(provider_cfg: llm_mod.ProviderCfg) -> None:
+    """Best-effort scrub of the key env var from this process so nothing
+    persists for the remainder of the run."""
+    if provider_cfg.forget_key:
+        os.environ.pop(provider_cfg.key_env, None)
 
 
 def _lock_dir(path: Path) -> str | None:
@@ -116,28 +150,55 @@ def cmd_scan(args: argparse.Namespace) -> int:
     detectors = build_active(disable=cfg.disable, enable=cfg.enable,
                              custom=cfg.custom, denylist=cfg.denylist) + entity_dets
 
-    progress = make_cli_renderer(enabled=not getattr(args, "no_progress", False))
-    stats = process_tree(src, None, detectors, amap, allowlist_cf=cfg.allowlist_cf,
-                         include=cfg.include, exclude=cfg.exclude,
-                         max_bytes=cfg.max_bytes, write=False, exclude_dirs={PII_DIRNAME},
-                         stream_threshold=cfg.stream_threshold, progress=progress)
-    pii_dir = src / PII_DIRNAME
-    summary = build_summary(mode="scan", src=str(src), dst=None, timestamp=_now(),
-                            version=__version__, amap=amap, stats=stats,
-                            entities=len(amap.legend()))
-    write_json(summary, pii_dir / "scan_report.json")
-    write_html(summary, pii_dir / "scan_report.html")
+    # ---- optional LLM second pass (PREVIEW: nothing is written) ----
+    post_pass = None
+    # MED 4: build the provider cfg up-front so the finally block can ALWAYS
+    # scrub the key (when --forget-key) regardless of how the run ends.
+    provider_cfg = _build_provider_cfg(cfg, args) if _llm_enabled(cfg, args) else None
+    try:
+        if provider_cfg is not None:
+            try:
+                llm_mod.enforce_cloud_gate(provider_cfg)
+                llm_mod.load_key(provider_cfg)
+            except llm_mod.LLMError as e:
+                raise SystemExit(f"error: {e}")
 
-    out = {"mode": "scan", "files_total": stats.files_total,
-           "files_processed": stats.files_processed,
-           "would_replace": stats.replacements,
-           "report": str(pii_dir / "scan_report.html")}
-    if args.emit_entities:
-        n = entities_mod.write_starter_csv(amap, pii_dir / "entities_starter.csv")
-        out["entities_starter"] = str(pii_dir / "entities_starter.csv")
-        out["entities_rows"] = n
-    print(json.dumps(out, indent=2))
-    return 0
+            def post_pass(rel: str, stripped_text: str) -> tuple[str, int]:
+                try:
+                    return llm_mod.second_pass(
+                        stripped_text, amap, provider_cfg=provider_cfg, file=rel)
+                except llm_mod.LLMError as e:
+                    if provider_cfg.strict:
+                        raise SystemExit(f"error: LLM pass ({rel}): {e}")
+                    sys.stderr.write(f"piiscrub: LLM pass warning ({rel}): {e}\n")
+                    return stripped_text, 0
+
+        progress = make_cli_renderer(enabled=not getattr(args, "no_progress", False))
+        stats = process_tree(src, None, detectors, amap, allowlist_cf=cfg.allowlist_cf,
+                             include=cfg.include, exclude=cfg.exclude,
+                             max_bytes=cfg.max_bytes, write=False, exclude_dirs={PII_DIRNAME},
+                             stream_threshold=cfg.stream_threshold, progress=progress,
+                             post_pass=post_pass)
+        pii_dir = src / PII_DIRNAME
+        summary = build_summary(mode="scan", src=str(src), dst=None, timestamp=_now(),
+                                version=__version__, amap=amap, stats=stats,
+                                entities=len(amap.legend()))
+        write_json(summary, pii_dir / "scan_report.json")
+        write_html(summary, pii_dir / "scan_report.html")
+
+        out = {"mode": "scan", "files_total": stats.files_total,
+               "files_processed": stats.files_processed,
+               "would_replace": stats.replacements,
+               "report": str(pii_dir / "scan_report.html")}
+        if args.emit_entities:
+            n = entities_mod.write_starter_csv(amap, pii_dir / "entities_starter.csv")
+            out["entities_starter"] = str(pii_dir / "entities_starter.csv")
+            out["entities_rows"] = n
+        print(json.dumps(out, indent=2))
+        return 0
+    finally:
+        if provider_cfg is not None:
+            _forget_key_now(provider_cfg)
 
 
 def cmd_strip(args: argparse.Namespace) -> int:
@@ -156,6 +217,10 @@ def cmd_strip(args: argparse.Namespace) -> int:
             raise SystemExit("error: --project vault must not be inside the source or target tree")
 
     vault = None
+    # MED 4: build the provider cfg up-front so the finally block can ALWAYS
+    # scrub the key (when --forget-key) regardless of how the run ends —
+    # success, LLMError, SystemExit, or any other exception.
+    provider_cfg = _build_provider_cfg(cfg, args) if _llm_enabled(cfg, args) else None
     try:
         if args.project:
             vault = Vault(Path(args.project)).open()
@@ -169,11 +234,38 @@ def cmd_strip(args: argparse.Namespace) -> int:
         detectors = build_active(disable=cfg.disable, enable=cfg.enable,
                                  custom=cfg.custom, denylist=cfg.denylist) + entity_dets
 
+        # ---- optional LLM second pass -----------------------------------
+        post_pass = None
+        llm_strict_failed = {"hit": False, "reason": ""}
+        if provider_cfg is not None:
+            # Fail fast (before touching any file): enforce the cloud gate and
+            # confirm the key is available. Nothing is sent here.
+            try:
+                llm_mod.enforce_cloud_gate(provider_cfg)
+                llm_mod.load_key(provider_cfg)   # raises if a needed key is absent
+            except llm_mod.LLMError as e:
+                # A blocked cloud endpoint / missing key is a hard config error
+                # regardless of strict mode — refuse before processing anything.
+                raise SystemExit(f"error: {e}")
+
+            def post_pass(rel: str, stripped_text: str) -> tuple[str, int]:
+                try:
+                    return llm_mod.second_pass(
+                        stripped_text, amap, provider_cfg=provider_cfg, file=rel)
+                except llm_mod.LLMError as e:
+                    if provider_cfg.strict:
+                        llm_strict_failed["hit"] = True
+                        llm_strict_failed["reason"] = f"{rel}: {e}"
+                    sys.stderr.write(f"piiscrub: LLM pass warning ({rel}): {e}\n")
+                    # Fail-open: leave the regex-stripped text unchanged.
+                    return stripped_text, 0
+
         progress = make_cli_renderer(enabled=not getattr(args, "no_progress", False))
         stats = process_tree(src, dst, detectors, amap, allowlist_cf=cfg.allowlist_cf,
                              include=cfg.include, exclude=cfg.exclude,
                              max_bytes=cfg.max_bytes, write=True, exclude_dirs={PII_DIRNAME},
-                             stream_threshold=cfg.stream_threshold, progress=progress)
+                             stream_threshold=cfg.stream_threshold, progress=progress,
+                             post_pass=post_pass)
 
         manifest = manifest_mod.build_manifest(src, dst, stats, timestamp=ts, version=__version__)
         audit = verify_tree(dst, detectors, cfg.allowlist_cf)
@@ -215,12 +307,22 @@ def cmd_strip(args: argparse.Namespace) -> int:
                "run_digest": manifest["run_digest_sha256"], "verify": verify_status}
         if lock_warn:
             out["warning"] = lock_warn
+        if llm_strict_failed["hit"]:
+            out["llm_strict_failed"] = llm_strict_failed["reason"]
         print(json.dumps(out, indent=2))
         if not audit["clean"]:
             sys.stderr.write(json.dumps({"verify_failed": audit}, indent=2) + "\n")
             return 10
+        if llm_strict_failed["hit"]:
+            sys.stderr.write(
+                json.dumps({"llm_strict_failed": llm_strict_failed["reason"]}, indent=2) + "\n")
+            return 11
         return 0
     finally:
+        # MED 4: ALWAYS scrub the key (when --forget-key) — even on error /
+        # SystemExit — so it never lingers in the environment after the run.
+        if provider_cfg is not None:
+            _forget_key_now(provider_cfg)
         if vault is not None:
             vault.close()
 
@@ -291,6 +393,28 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--max-bytes", type=int, dest="max_bytes", help="hard skip files larger than N bytes (default: effectively off; huge files are streamed)")
         sp.add_argument("--stream-threshold", type=int, dest="stream_threshold", help="stream files larger than N bytes in chunks (default 50MB)")
         sp.add_argument("--no-progress", action="store_true", help="suppress the stderr progress bar")
+        # ---- optional LLM second pass (OFF unless --llm) ----
+        sp.add_argument("--llm", action="store_true",
+                        help="run an optional LLM second pass over the ALREADY-STRIPPED "
+                             "text to flag residual PII the regex missed (off by default)")
+        sp.add_argument("--llm-provider", choices=["ollama", "openai", "anthropic"],
+                        dest="llm_provider", help="LLM provider (default: ollama, local)")
+        sp.add_argument("--llm-endpoint", dest="llm_endpoint",
+                        help="LLM endpoint base URL (default: local Ollama at "
+                             "http://127.0.0.1:11434)")
+        sp.add_argument("--llm-model", dest="llm_model", help="model name")
+        sp.add_argument("--llm-key-env", dest="llm_key_env",
+                        help="NAME of the env var holding the API key (never the key "
+                             "itself; default PIISCRUB_LLM_KEY). Local providers need none.")
+        sp.add_argument("--allow-cloud", action="store_true", dest="allow_cloud",
+                        help="REQUIRED to send already-stripped text to a non-local "
+                             "endpoint; without it a remote endpoint is refused")
+        sp.add_argument("--forget-key", action="store_true", dest="forget_key",
+                        help="scrub the API key from this process's environment after "
+                             "use so nothing persists")
+        sp.add_argument("--llm-strict", action="store_true", dest="llm_strict",
+                        help="fail-closed: exit non-zero on any LLM error instead of "
+                             "warning and continuing")
 
     s = sub.add_parser("scan", help="dry-run: detect + report, write nothing stripped")
     s.add_argument("source"); common(s)
