@@ -295,6 +295,38 @@ PII and any stray decode/report sidecars) when it is not.
 
 ---
 
+## Graphical interface
+
+`piiscrub-gui` is a `PySide6` windowed front-end that wraps scan and strip with
+folder pickers, a profile dropdown, optional project vault and entities CSV
+pickers, a live progress bar, and an open-report button.
+
+Install the extra dependency locally:
+
+```bash
+pip install -e .[gui]
+# or
+pip install -r requirements-gui.txt
+```
+
+Then launch:
+
+```bash
+piiscrub-gui
+```
+
+The GUI covers the same core workflow as Examples 1–3 above: pick a source
+folder, optionally a target folder, choose a profile, point at a vault and
+entities CSV if needed, then click **Scan** (dry-run) or **Strip**. The
+results panel shows the same summary JSON that the CLI prints. Click **Open
+report** to view the HTML report in your default browser.
+
+The GUI exe (`piiscrub-gui.exe`, windowed, no console) is built by a separate
+CI workflow (`build-windows-gui-exe.yml`) and attached to the same GitHub
+Release as the CLI exe on tag pushes.
+
+---
+
 ## Reference: common flags
 
 | Flag | Applies to | Purpose |

@@ -1,0 +1,118 @@
+name: Build piiscrub-gui (Windows EXE)
+
+# Automated Windows build of the piiscrub GUI. No local build needed:
+#   - Push to any branch                  -> builds, uploads the .exe artifact
+#   - "Run workflow" button               -> build on demand
+#   - Push a tag  v*                       -> attaches piiscrub-gui.exe to the
+#     release that the CLI workflow already created for the same tag.
+#
+# Release strategy — create vs upload split:
+#   The CLI workflow (build-windows-exe.yml) calls `gh release create` on tag
+#   pushes.  This GUI workflow deliberately does NOT call `gh release create`
+#   (that would race or fail if the release already exists).  Instead it calls
+#   `gh release upload --clobber` with a short retry loop so it attaches the
+#   GUI exe to whichever workflow finishes first.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["**"]
+    tags:
+      - "v*"
+
+permissions:
+  contents: write          # needed to upload to a Release on tag pushes
+
+concurrency:
+  group: build-piiscrub-gui-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          # The build never runs git commands; the release step uses GH_TOKEN
+          # (gh CLI), not git creds — so don't persist credentials into .git.
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-gui.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-gui.txt
+
+      - name: Run tests
+        run: python -m pytest -q
+
+      - name: Headless GUI smoke test
+        # Drives a real scan through the QThread worker offscreen, asserting the
+        # done-signal path fires (not just construction).
+        # QT_QPA_PLATFORM=offscreen avoids needing a real display.
+        # PYTHONPATH=src so piiscrub package resolves without pip install -e .
+        shell: pwsh
+        run: |
+          $env:QT_QPA_PLATFORM = "offscreen"
+          $env:PYTHONPATH = "src"
+          python packaging/gui_smoke.py
+          if ($LASTEXITCODE -ne 0) { throw "GUI smoke test failed (exit $LASTEXITCODE)" }
+
+      - name: Build EXE (PyInstaller)
+        run: pyinstaller --noconfirm --clean packaging/piiscrub-gui.spec
+
+      - name: Verify the EXE was produced
+        shell: pwsh
+        run: |
+          $exe = "dist/piiscrub-gui.exe"
+          if (-not (Test-Path $exe)) { throw "Build did not produce $exe" }
+          Get-Item $exe | Format-List Name, Length, LastWriteTime
+
+      - name: Upload EXE artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: piiscrub-windows-gui-exe
+          path: dist/piiscrub-gui.exe
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Attach to Release (tag pushes only, best-effort)
+        # Deliberately uses `gh release upload` (not `gh release create`) to
+        # attach alongside the CLI exe on the release the CLI workflow creates.
+        # Retry loop handles the race where this workflow finishes before the
+        # CLI workflow has created the release.
+        # Non-fatal: if the release does not exist (CLI build failed/skipped),
+        # a warning is emitted and the job stays green — the exe remains
+        # available as a build artifact.
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          $maxAttempts = 5
+          $attempt = 0
+          $uploaded = $false
+          while (-not $uploaded -and $attempt -lt $maxAttempts) {
+            $attempt++
+            Write-Host "Upload attempt $attempt of $maxAttempts …"
+            gh release upload "$env:TAG" dist/piiscrub-gui.exe --clobber
+            if ($LASTEXITCODE -eq 0) {
+              $uploaded = $true
+              Write-Host "Upload succeeded on attempt $attempt."
+            } else {
+              Write-Host "Upload failed (exit $LASTEXITCODE). Waiting 15 s before retry …"
+              Start-Sleep -Seconds 15
+            }
+          }
+          if (-not $uploaded) {
+            Write-Warning "Could not attach piiscrub-gui.exe to release $env:TAG after $maxAttempts attempts (the release may not exist if the CLI build did not run/succeed). The exe is still available as a build artifact."
+          }

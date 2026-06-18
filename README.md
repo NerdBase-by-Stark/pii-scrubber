@@ -317,6 +317,29 @@ backlog — see
 
 ---
 
+## Graphical interface (piiscrub-gui)
+
+A `console=False` Windows exe wraps scan and strip with folder pickers, a
+profile dropdown, live progress, and an open-report button. Install the extra
+deps locally with:
+
+```bash
+pip install -e .[gui]
+# or
+pip install -r requirements-gui.txt
+```
+
+Then launch with:
+
+```bash
+piiscrub-gui
+```
+
+The GUI exe is built separately by CI (`build-windows-gui-exe.yml`) and attached
+to the same release as the CLI exe on tag pushes.
+
+---
+
 ## Build (Windows `.exe`)
 
 No runtime dependencies — stdlib only (needs Python 3.11+ for `tomllib`). The
@@ -326,6 +349,10 @@ self-test gate):
 
 * Push any branch → builds and uploads the `.exe` artifact.
 * Push a tag `v*` → builds and publishes a Release with the `.exe` attached.
+
+The GUI exe (`piiscrub-gui.exe`, `console=False`) is built by a parallel CI
+workflow and attached to the same Release. Both exes are available from the
+Artifacts section of each workflow run.
 
 Code signing is deferred. On first run, a Windows SmartScreen warning clears via
 right-click → **Properties** → **Unblock** → OK.
