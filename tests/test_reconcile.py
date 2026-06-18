@@ -496,6 +496,49 @@ def test_reconcile_corrupt_map_errors(tmp_path):
     bad_map = tmp_path / "map.json"
     bad_map.write_text("not json {{{", encoding="utf-8")
 
-    with pytest.raises(SystemExit):
+    with pytest.raises(SystemExit) as excinfo:
         main(["reconcile", str(src), str(tmp_path / "dst"),
               "--map", str(bad_map)])
+    msg = str(excinfo.value).lower()
+    assert "map" in msg and ("invalid" in msg or "json" in msg)
+
+
+def test_reconcile_wrong_shape_map_errors(tmp_path):
+    """Valid JSON with the wrong structure (not an alias->object table) fails
+    fast with a readable SystemExit, not an opaque traceback later."""
+    src = tmp_path / "src"
+    _write(src / "f.txt", "<A_1> here\n")
+
+    # valid JSON, but a list — not an alias table
+    bad_shape = tmp_path / "map.json"
+    bad_shape.write_text(json.dumps(["not", "a", "table"]), encoding="utf-8")
+
+    with pytest.raises(SystemExit) as excinfo:
+        main(["reconcile", str(src), str(tmp_path / "dst"), "--map", str(bad_shape)])
+    assert "map" in str(excinfo.value).lower()
+
+    # valid JSON object, but an entry value is not an object
+    bad_entry = tmp_path / "map2.json"
+    bad_entry.write_text(json.dumps({"<A_1>": "should-be-an-object"}), encoding="utf-8")
+    with pytest.raises(SystemExit):
+        main(["reconcile", str(src), str(tmp_path / "dst2"), "--map", str(bad_entry)])
+
+
+def test_reconcile_output_is_a_file_errors(tmp_path):
+    """If the output path already exists as a FILE, reconcile must refuse with a
+    clear message rather than crashing on mkdir."""
+    src = tmp_path / "src"
+    _write(src / "f.txt", "<A_1> here\n")
+    entries = {"<A_1>": {"original": "v", "category": "t", "count": 1, "files": [],
+                         "entity": None, "superseded_by": "<B_1>"},
+               "<B_1>": {"original": "v", "category": "t", "count": 0, "files": [],
+                         "entity": None}}
+    map_file = tmp_path / "map.json"
+    map_file.write_text(json.dumps(_make_vault_map(entries)), encoding="utf-8")
+
+    out_file = tmp_path / "out_is_file"
+    out_file.write_text("i am a file, not a dir", encoding="utf-8")
+
+    with pytest.raises(SystemExit) as excinfo:
+        main(["reconcile", str(src), str(out_file), "--map", str(map_file)])
+    assert "not a directory" in str(excinfo.value).lower()

@@ -27,9 +27,15 @@ def load_alias_table(map_path: Path) -> dict[str, dict]:
     """
     with open(map_path, encoding="utf-8") as fh:
         data = json.load(fh)
-    if isinstance(data, dict) and "entries" in data:
-        return data["entries"]
-    return data
+    table = data["entries"] if isinstance(data, dict) and "entries" in data else data
+    # Fail fast on valid-JSON-but-wrong-shape so reconcile exits with a clear
+    # message instead of crashing later in build_canonical_map.
+    if not isinstance(table, dict):
+        raise ValueError("alias table must be a JSON object mapping alias -> metadata")
+    for alias, meta in table.items():
+        if not isinstance(alias, str) or not isinstance(meta, dict):
+            raise ValueError(f"invalid alias-table entry for {alias!r}: expected str -> object")
+    return table
 
 
 def build_canonical_map(table: dict[str, dict]) -> dict[str, str]:
@@ -49,8 +55,8 @@ def build_canonical_map(table: dict[str, dict]) -> dict[str, str]:
         current = start
         while True:
             nxt = table[current].get("superseded_by")
-            if nxt is None:
-                # current is terminal
+            if not isinstance(nxt, str):
+                # None or a non-string (corrupt) pointer -> current is terminal
                 terminal = current
                 break
             if nxt in visited or nxt not in table:

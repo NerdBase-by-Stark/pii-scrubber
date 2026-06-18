@@ -366,11 +366,14 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     if not getattr(args, "map", None) and not getattr(args, "project", None):
         raise SystemExit("error: reconcile needs --map or --project")
 
-    if output_path.exists() and output_path.is_dir() and any(output_path.iterdir()):
-        raise SystemExit(
-            f"error: output dir is not empty: {output_path}; reconcile writes a fresh "
-            "custody-tracked copy — use a new/empty output dir"
-        )
+    if output_path.exists():
+        if not output_path.is_dir():
+            raise SystemExit(f"error: output exists and is not a directory: {output_path}")
+        if any(output_path.iterdir()):
+            raise SystemExit(
+                f"error: output dir is not empty: {output_path}; reconcile writes a fresh "
+                "custody-tracked copy — use a new/empty output dir"
+            )
 
     vault = None
     try:
@@ -385,8 +388,8 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
 
         try:
             table = reconcile_mod.load_alias_table(map_path)
-        except json.JSONDecodeError as e:
-            raise SystemExit(f"error: map file is not valid JSON: {map_path}: {e}")
+        except (json.JSONDecodeError, ValueError) as e:
+            raise SystemExit(f"error: invalid map file {map_path}: {e}")
         canonical_map = reconcile_mod.build_canonical_map(table)
 
         output_path.mkdir(parents=True, exist_ok=True)
