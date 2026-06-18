@@ -19,6 +19,10 @@ _pii/
 decode.json
 *_decode.json
 
+# Internal handover/notes — co-located in the project but NEVER pushed
+# (references the confidential origin of this tool)
+/HANDOVER.md
+
 # OS
 .DS_Store
 Thumbs.db
