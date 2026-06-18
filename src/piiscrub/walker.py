@@ -69,6 +69,30 @@ BINARY_EXTS = {
 }
 
 
+# Binary capture/log formats that typically hold lots of PII but must be
+# exported to TEXT first — piiscrub is a text scrubber, so it copies these
+# through untouched. Map extension -> a one-line "how to get text out" hint
+# that is appended to the skip warning so the operator isn't left guessing
+# why a capture full of IPs/MACs produced zero replacements.
+_CAPTURE_EXPORT_HINTS: dict[str, str] = {
+    ".pcap": ("export to text first (Wireshark: File > Export Packet Dissections "
+              "> As CSV/Plain Text, or `tshark -r FILE -V > out.txt`), then re-run "
+              "on the text with --profile pcap-text"),
+    ".evtx": ("export to text first (`wevtutil qe FILE /lf:true /f:text > out.txt`), "
+              "then re-run"),
+}
+_CAPTURE_EXPORT_HINTS[".pcapng"] = _CAPTURE_EXPORT_HINTS[".pcap"]
+_CAPTURE_EXPORT_HINTS[".cap"] = _CAPTURE_EXPORT_HINTS[".pcap"]
+_CAPTURE_EXPORT_HINTS[".etl"] = _CAPTURE_EXPORT_HINTS[".evtx"]
+
+
+def _capture_export_hint(suffix: str) -> str:
+    """Return ' — <hint>' for binary capture/log formats that need a text
+    export first (pcap/evtx/…), else ''. Appended to the skip warning."""
+    hint = _CAPTURE_EXPORT_HINTS.get(suffix.lower())
+    return f" — {hint}" if hint else ""
+
+
 @dataclass
 class FileStat:
     rel: str
@@ -369,7 +393,8 @@ def process_tree(
 
         if path.suffix.lower() in BINARY_EXTS:
             _copy_through(rel, "binary",
-                          f"{rel}: binary type, copied unprocessed (may contain PII)")
+                          f"{rel}: binary type, copied unprocessed (may contain PII)"
+                          + _capture_export_hint(path.suffix))
             files_done += 1
             bytes_done_total += size
             _emit(rel)
