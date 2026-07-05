@@ -2,7 +2,8 @@
 single-file gz/bz2/xz) and the verify archive-recursion hook.
 
 All fixtures are built programmatically in-test with the stdlib (zipfile /
-tarfile / gzip / bz2 / lzma); no binary blobs live in git. The archives handler
+tarfile / gzip / bz2 / lzma)
+no binary blobs live in git. The archives handler
 turns a supported archive in SRC into a same-format archive in DST whose text
 members are scrubbed, whose supported-binary members are delegated to a nested
 handler, and whose unknown-binary members are copied in unchanged + flagged.
@@ -87,7 +88,9 @@ def test_handler_registered_for_all_suffixes():
 # zip round-trip: text scrubbed, binary copied+flagged, stdlib-readable.
 
 def test_zip_roundtrip_text_scrubbed_binary_copied(tmp_path: Path):
-    src = tmp_path / "src"; dst = tmp_path / "dst"; src.mkdir()
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
     png = b"\x89PNG\r\n\x1a\n raw 10.0.0.9 bytes"
     (src / "logs.zip").write_bytes(_zip_bytes({
         "logs/app.log": "user a@b.com ip 10.0.0.9\n",
@@ -111,7 +114,9 @@ def test_zip_roundtrip_text_scrubbed_binary_copied(tmp_path: Path):
 
 
 def test_tar_gz_roundtrip_preserves_mtime_and_order(tmp_path: Path):
-    src = tmp_path / "src"; dst = tmp_path / "dst"; src.mkdir()
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
     (src / "bundle.tar.gz").write_bytes(_targz_bytes({
         "a/first.log": "mail c@d.com host 192.168.1.5\n",
         "a/second.log": "ip 10.1.2.3\n",
@@ -130,7 +135,9 @@ def test_tar_gz_roundtrip_preserves_mtime_and_order(tmp_path: Path):
 
 @pytest.mark.parametrize("comp,mode", [("bz2", "r:bz2"), ("xz", "r:xz")])
 def test_tar_bz2_and_xz_roundtrip(tmp_path: Path, comp: str, mode: str):
-    src = tmp_path / "src"; dst = tmp_path / "dst"; src.mkdir()
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
     name = f"pack.tar.{comp}"
     (src / name).write_bytes(_targz_bytes({"log.txt": "ip 8.8.8.8\n"}, comp=comp))
     stats = _run(src, dst)
@@ -141,7 +148,9 @@ def test_tar_bz2_and_xz_roundtrip(tmp_path: Path, comp: str, mode: str):
 
 
 def test_tgz_extension_treated_as_tar_gz(tmp_path: Path):
-    src = tmp_path / "src"; dst = tmp_path / "dst"; src.mkdir()
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
     (src / "arch.tgz").write_bytes(_targz_bytes({"a.log": "ip 10.0.0.9\n"}))
     _run(src, dst)
     with tarfile.open(dst / "arch.tgz") as t:
@@ -152,7 +161,9 @@ def test_tgz_extension_treated_as_tar_gz(tmp_path: Path):
 # Nested archives (depth) + shared aliasing.
 
 def test_nested_zip_members_scrubbed(tmp_path: Path):
-    src = tmp_path / "src"; dst = tmp_path / "dst"; src.mkdir()
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
     inner = _zip_bytes({"deep.log": "ip 10.0.0.7 mail x@y.com\n"})
     (src / "outer.zip").write_bytes(_zip_bytes({"nested.zip": inner}))
     stats = _run(src, dst)
@@ -167,7 +178,9 @@ def test_nested_zip_members_scrubbed(tmp_path: Path):
 
 
 def test_depth_cap_copies_too_deep_nested_archive_unchanged(tmp_path: Path):
-    src = tmp_path / "src"; dst = tmp_path / "dst"; src.mkdir()
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
     lvl3 = _zip_bytes({"deep.log": "ip 10.0.0.3\n"})
     lvl2 = _zip_bytes({"l3.zip": lvl3})
     lvl1 = _zip_bytes({"l2.zip": lvl2})
@@ -186,7 +199,9 @@ def test_depth_cap_copies_too_deep_nested_archive_unchanged(tmp_path: Path):
 
 
 def test_same_ip_across_archive_and_plain_log_shares_alias(tmp_path: Path):
-    src = tmp_path / "src"; dst = tmp_path / "dst"; src.mkdir()
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
     (src / "a.log").write_text("ip 10.0.0.9\n", encoding="utf-8")
     (src / "b.zip").write_bytes(_zip_bytes({"inner.log": "ip 10.0.0.9\n"}))
     amap = AliasMap()
@@ -205,7 +220,9 @@ def test_same_ip_across_archive_and_plain_log_shares_alias(tmp_path: Path):
 # Guards.
 
 def test_traversal_member_skipped_and_flagged(tmp_path: Path):
-    src = tmp_path / "src"; dst = tmp_path / "dst"; src.mkdir()
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
     (src / "trav.zip").write_bytes(_zip_bytes({
         "../evil.txt": "ip 10.0.0.9",
         "ok.txt": "ip 10.0.0.8",
@@ -217,7 +234,9 @@ def test_traversal_member_skipped_and_flagged(tmp_path: Path):
 
 
 def test_absolute_member_skipped(tmp_path: Path):
-    src = tmp_path / "src"; dst = tmp_path / "dst"; src.mkdir()
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
     (src / "abs.zip").write_bytes(_zip_bytes({"/etc/passwd": "ip 10.0.0.9", "ok.log": "x"}))
     _run(src, dst)
     with zipfile.ZipFile(dst / "abs.zip") as z:
@@ -225,7 +244,9 @@ def test_absolute_member_skipped(tmp_path: Path):
 
 
 def test_encrypted_zip_falls_back_to_copy_and_flag(tmp_path: Path):
-    src = tmp_path / "src"; dst = tmp_path / "dst"; src.mkdir()
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
     (src / "enc.zip").write_bytes(_encrypted_zip_bytes())
     stats = _run(src, dst)
     assert stats.files_extracted == 0 and stats.files_copied == 1
@@ -236,7 +257,9 @@ def test_encrypted_zip_falls_back_to_copy_and_flag(tmp_path: Path):
 
 
 def test_max_members_cap_trips_extracterror_copy_through(tmp_path: Path):
-    src = tmp_path / "src"; dst = tmp_path / "dst"; src.mkdir()
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
     (src / "many.zip").write_bytes(_zip_bytes({f"f{i}.log": f"ip 10.0.0.{i}" for i in range(5)}))
     stats = _run(src, dst, extract=ExtractConfig(limits=ExtractLimits(max_members=2)))
     assert stats.files_extracted == 0 and stats.files_copied == 1
@@ -245,7 +268,9 @@ def test_max_members_cap_trips_extracterror_copy_through(tmp_path: Path):
 
 
 def test_max_out_bytes_bomb_cap_trips_extracterror(tmp_path: Path):
-    src = tmp_path / "src"; dst = tmp_path / "dst"; src.mkdir()
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
     # a member whose declared uncompressed size dwarfs the cap
     (src / "bomb.zip").write_bytes(_zip_bytes({"big.log": "A" * 100_000}))
     stats = _run(src, dst, extract=ExtractConfig(limits=ExtractLimits(max_out_bytes=1000)))
@@ -255,7 +280,9 @@ def test_max_out_bytes_bomb_cap_trips_extracterror(tmp_path: Path):
 
 
 def test_corrupt_zip_falls_back_to_copy(tmp_path: Path):
-    src = tmp_path / "src"; dst = tmp_path / "dst"; src.mkdir()
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
     (src / "broken.zip").write_bytes(b"PK\x03\x04 not really a zip \x00\x01")
     stats = _run(src, dst)
     assert stats.files_extracted == 0 and stats.files_copied == 1
@@ -265,7 +292,9 @@ def test_corrupt_zip_falls_back_to_copy(tmp_path: Path):
 def test_partial_output_not_left_on_extracterror(tmp_path: Path):
     """A cap tripped mid-build must leave NO repacked archive in DST (fail-open
     to copy-through, never a truncated partial)."""
-    src = tmp_path / "src"; dst = tmp_path / "dst"; src.mkdir()
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
     (src / "many.zip").write_bytes(_zip_bytes({f"f{i}.log": f"ip 10.0.0.{i}" for i in range(5)}))
     _run(src, dst, extract=ExtractConfig(limits=ExtractLimits(max_members=2)))
     # exactly one file in DST: the copied-through original (no *.part leftovers)
@@ -279,7 +308,9 @@ def test_partial_output_not_left_on_extracterror(tmp_path: Path):
 @pytest.mark.parametrize("comp,compress", [
     ("gz", gzip.compress), ("bz2", bz2.compress), ("xz", lzma.compress)])
 def test_single_file_text_recompressed_same_format(tmp_path: Path, comp, compress):
-    src = tmp_path / "src"; dst = tmp_path / "dst"; src.mkdir()
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
     name = f"note.log.{comp}"
     (src / name).write_bytes(compress(b"email e@f.com ip 8.8.4.4\n"))
     stats = _run(src, dst)
@@ -293,7 +324,9 @@ def test_single_file_text_recompressed_same_format(tmp_path: Path, comp, compres
 
 
 def test_single_file_binary_without_handler_copies_through(tmp_path: Path):
-    src = tmp_path / "src"; dst = tmp_path / "dst"; src.mkdir()
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
     # a gz of a NUL-laden binary whose inner suffix (.bin) has no handler
     (src / "blob.bin.gz").write_bytes(gzip.compress(b"\x00\x01\x02 ip 10.0.0.9 \x00"))
     stats = _run(src, dst)
@@ -321,7 +354,9 @@ def test_single_file_gz_delegates_to_nested_handler_derivative(tmp_path: Path):
 
     register(_Dummy())
     try:
-        src = tmp_path / "src"; dst = tmp_path / "dst"; src.mkdir()
+        src = tmp_path / "src"
+        dst = tmp_path / "dst"
+        src.mkdir()
         (src / "x.dummyx.gz").write_bytes(gzip.compress(b"mail g@h.com ip 1.2.3.4"))
         stats = _run(src, dst)
         assert stats.files_extracted == 1
@@ -341,7 +376,8 @@ def test_single_file_gz_delegates_to_nested_handler_derivative(tmp_path: Path):
 # scan (write=False) drives extraction in memory, writes nothing.
 
 def test_scan_writes_nothing_but_counts_and_aliases(tmp_path: Path):
-    src = tmp_path / "src"; src.mkdir()
+    src = tmp_path / "src"
+    src.mkdir()
     (src / "logs.zip").write_bytes(_zip_bytes({"app.log": "user a@b.com ip 10.0.0.9\n"}))
     amap = AliasMap()
     stats = process_tree(src, None, build_active(), amap, max_bytes=10 ** 9,
@@ -356,28 +392,32 @@ def test_scan_writes_nothing_but_counts_and_aliases(tmp_path: Path):
 # verify archive-recursion.
 
 def test_verify_recursion_catches_planted_leak_inside_zip(tmp_path: Path):
-    dst = tmp_path / "dst"; dst.mkdir()
+    dst = tmp_path / "dst"
+    dst.mkdir()
     (dst / "planted.zip").write_bytes(_zip_bytes({
         "m/plain.log": "contact leak@evil.com from 203.0.113.9\n"}))
     res = audit.verify_tree(dst, build_active())
     assert res["clean"] is False
-    files = {l["file"] for l in res["leaks"]}
-    cats = {l["category"] for l in res["leaks"]}
+    files = {leak["file"] for leak in res["leaks"]}
+    cats = {leak["category"] for leak in res["leaks"]}
     assert "planted.zip!m/plain.log" in files
     assert "email" in cats and "ipv4" in cats
 
 
 def test_verify_recursion_into_nested_archive(tmp_path: Path):
-    dst = tmp_path / "dst"; dst.mkdir()
+    dst = tmp_path / "dst"
+    dst.mkdir()
     inner = _zip_bytes({"deep.log": "leak 203.0.113.9\n"})
     (dst / "outer.zip").write_bytes(_zip_bytes({"nested.zip": inner}))
     res = audit.verify_tree(dst, build_active())
     assert res["clean"] is False
-    assert any(l["file"] == "outer.zip!nested.zip!deep.log" for l in res["leaks"])
+    assert any(l["file"] == "outer.zip!nested.zip!deep.log" for leak in res["leaks"])
 
 
 def test_verify_clean_when_members_scrubbed(tmp_path: Path):
-    src = tmp_path / "src"; dst = tmp_path / "dst"; src.mkdir()
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
     (src / "logs.zip").write_bytes(_zip_bytes({"app.log": "ip 10.0.0.9 mail a@b.com\n"}))
     _run(src, dst)
     res = audit.verify_tree(dst, build_active())
@@ -385,7 +425,8 @@ def test_verify_clean_when_members_scrubbed(tmp_path: Path):
 
 
 def test_verify_no_extract_skips_archive_recursion(tmp_path: Path):
-    dst = tmp_path / "dst"; dst.mkdir()
+    dst = tmp_path / "dst"
+    dst.mkdir()
     (dst / "planted.zip").write_bytes(_zip_bytes({
         "plain.log": "leak leak@evil.com 203.0.113.9\n"}))
     # --no-extract -> archive members are NOT re-scanned (documented weaker)
@@ -394,11 +435,12 @@ def test_verify_no_extract_skips_archive_recursion(tmp_path: Path):
 
 
 def test_verify_recursion_into_single_file_gz(tmp_path: Path):
-    dst = tmp_path / "dst"; dst.mkdir()
+    dst = tmp_path / "dst"
+    dst.mkdir()
     (dst / "note.log.gz").write_bytes(gzip.compress(b"leak 203.0.113.9\n"))
     res = audit.verify_tree(dst, build_active())
     assert res["clean"] is False
-    assert any("note.log.gz" in l["file"] for l in res["leaks"])
+    assert any("note.log.gz" in leak["file"] for leak in res["leaks"])
 
 
 # ----------------------------------------------------------------------
@@ -420,7 +462,9 @@ def test_process_raises_for_unreadable_and_leaves_no_output(tmp_path: Path):
 # (regression: getmembers()/member read raised tarfile.ReadError uncaught).
 
 def test_truncated_tar_falls_back_to_copy_and_flag(tmp_path: Path):
-    src = tmp_path / "src"; dst = tmp_path / "dst"; src.mkdir()
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
     # A member whose DATA block spans well past the cut: getmembers() sees a
     # valid header (declared size 3000) but the member read hits EOF and
     # tarfile raises ReadError('unexpected end of data').
@@ -433,7 +477,9 @@ def test_truncated_tar_falls_back_to_copy_and_flag(tmp_path: Path):
 
 
 def test_truncated_targz_falls_back_to_copy(tmp_path: Path):
-    src = tmp_path / "src"; dst = tmp_path / "dst"; src.mkdir()
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
     full = _targz_bytes({"a.log": "ip 10.0.0.9\n" * 500}, comp="gz")
     (src / "cut.tar.gz").write_bytes(full[:len(full) - 40])   # truncate the gz tail
     stats = _run(src, dst)   # must NOT raise
@@ -458,7 +504,9 @@ def _pcap_bytes(payload: bytes) -> bytes:
 
 
 def test_disabled_extractor_not_run_on_archive_member(tmp_path: Path):
-    src = tmp_path / "src"; dst = tmp_path / "dst"; src.mkdir()
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
     pcap = _pcap_bytes(b"filler payload bytes here")
     (src / "bundle.zip").write_bytes(_zip_bytes({
         "cap.pcap": pcap, "app.log": "ip 10.0.0.9\n"}))
@@ -476,7 +524,9 @@ def test_disabled_extractor_not_run_on_archive_member(tmp_path: Path):
 
 def test_disabled_extractor_run_on_archive_member_when_enabled(tmp_path: Path):
     # Sanity opposite of the above: with pcap enabled the member IS dissected.
-    src = tmp_path / "src"; dst = tmp_path / "dst"; src.mkdir()
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
     pcap = _pcap_bytes(b"filler payload bytes here")
     (src / "bundle.zip").write_bytes(_zip_bytes({"cap.pcap": pcap}))
     _run(src, dst)   # extraction on by default
@@ -489,7 +539,9 @@ def test_disabled_extractor_run_on_archive_member_when_enabled(tmp_path: Path):
 # plain file that share the derivative's name must both survive (one renamed).
 
 def test_member_name_collision_deduped_in_repack(tmp_path: Path):
-    src = tmp_path / "src"; dst = tmp_path / "dst"; src.mkdir()
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
     pcap = _pcap_bytes(b"filler bytes")
     (src / "mix.zip").write_bytes(_zip_bytes({
         "cap.pcap": pcap,                       # -> cap.pcap.txt derivative
@@ -508,7 +560,8 @@ def test_member_name_collision_deduped_in_repack(tmp_path: Path):
 # never silently pass as clean (fail-closed guarantee otherwise hollow).
 
 def test_verify_truncated_archive_scan_reports_finding(tmp_path: Path):
-    dst = tmp_path / "dst"; dst.mkdir()
+    dst = tmp_path / "dst"
+    dst.mkdir()
     # A leak sits in the 3rd member, beyond a max_members=2 verify cap.
     (dst / "big.zip").write_bytes(_zip_bytes({
         "a.log": "clean\n", "b.log": "clean\n",
@@ -518,7 +571,7 @@ def test_verify_truncated_archive_scan_reports_finding(tmp_path: Path):
         dst, build_active(),
         extract=ExtractConfig(limits=ExtractLimits(max_members=2)))
     assert res["clean"] is False
-    cats = {l["category"] for l in res["leaks"]}
+    cats = {leak["category"] for leak in res["leaks"]}
     assert "archive-scan-truncated" in cats
 
 
@@ -576,26 +629,28 @@ def _zip_with_encrypted_flag(members: dict[str, str | bytes],
 # inner stream exceeds the cap (was: silent return -> planted leak passes).
 
 def test_verify_single_file_gz_over_cap_reports_truncated(tmp_path: Path):
-    dst = tmp_path / "dst"; dst.mkdir()
+    dst = tmp_path / "dst"
+    dst.mkdir()
     inner = b"leak carol@evil.com 203.0.113.9\n" + b"x" * 240
     (dst / "logs.gz").write_bytes(gzip.compress(inner))
     res = audit.verify_tree(
         dst, build_active(),
         extract=ExtractConfig(limits=ExtractLimits(max_out_bytes=100)))
     assert res["clean"] is False
-    cats = {l["category"] for l in res["leaks"]}
+    cats = {leak["category"] for leak in res["leaks"]}
     assert "archive-scan-truncated" in cats
-    assert any("logs.gz" in l["file"] for l in res["leaks"])
+    assert any("logs.gz" in leak["file"] for leak in res["leaks"])
 
 
 def test_verify_single_file_gz_under_cap_still_catches_leak(tmp_path: Path):
     # Control: within the cap the inner text is scanned normally and the planted
     # leak is caught as a real finding (not the truncation sentinel).
-    dst = tmp_path / "dst"; dst.mkdir()
+    dst = tmp_path / "dst"
+    dst.mkdir()
     (dst / "note.gz").write_bytes(gzip.compress(b"leak dave@evil.com 203.0.113.9\n"))
     res = audit.verify_tree(dst, build_active())
     assert res["clean"] is False
-    cats = {l["category"] for l in res["leaks"]}
+    cats = {leak["category"] for leak in res["leaks"]}
     assert "email" in cats and "archive-scan-truncated" not in cats
 
 
@@ -603,7 +658,8 @@ def test_verify_single_file_gz_under_cap_still_catches_leak(tmp_path: Path):
 # archive larger than the cap fails CLOSED (SCAN_TRUNCATED), never MemoryError.
 
 def test_verify_oversize_archive_reports_truncated_not_read(tmp_path: Path):
-    dst = tmp_path / "dst"; dst.mkdir()
+    dst = tmp_path / "dst"
+    dst.mkdir()
     (dst / "big.zip").write_bytes(_zip_bytes({"m/plain.log": "leak eve@evil.com 203.0.113.9\n"}))
     size = (dst / "big.zip").stat().st_size
     # Cap set BELOW the on-disk archive size -> the size guard trips before read.
@@ -611,7 +667,7 @@ def test_verify_oversize_archive_reports_truncated_not_read(tmp_path: Path):
         dst, build_active(),
         extract=ExtractConfig(limits=ExtractLimits(max_out_bytes=size - 1)))
     assert res["clean"] is False
-    cats = {l["category"] for l in res["leaks"]}
+    cats = {leak["category"] for leak in res["leaks"]}
     assert "archive-scan-truncated" in cats
 
 
@@ -632,15 +688,16 @@ def test_iter_text_members_oversize_yields_only_sentinel(tmp_path: Path):
     ["plain.log", "locked.bin"],     # plaintext first
 ])
 def test_verify_encrypted_member_order_independent(tmp_path: Path, order):
-    dst = tmp_path / "dst"; dst.mkdir()
+    dst = tmp_path / "dst"
+    dst.mkdir()
     members = {name: ("john.doe@example.com / 10.1.2.3\n" if name == "plain.log"
                       else "opaque-cipher-bytes") for name in order}
     data = _zip_with_encrypted_flag(members, encrypted={"locked.bin"})
     (dst / "mix.zip").write_bytes(data)
     res = audit.verify_tree(dst, build_active())
     assert res["clean"] is False
-    files = {l["file"] for l in res["leaks"]}
-    cats = {l["category"] for l in res["leaks"]}
+    files = {leak["file"] for leak in res["leaks"]}
+    cats = {leak["category"] for leak in res["leaks"]}
     assert "mix.zip!plain.log" in files
     assert "email" in cats and "ipv4" in cats
 
@@ -649,8 +706,11 @@ def test_verify_encrypted_member_order_independent(tmp_path: Path, order):
 # OPEN to copy-through + flag, never abort the run.
 
 def test_single_file_gz_write_enametoolong_falls_back(tmp_path: Path):
-    src = tmp_path / "src"; dst = tmp_path / "dst"; src.mkdir()
-    long_name = "a" * 245 + ".pcap.gz"       # 253 chars; deriv +'.txt' = 257 > 255
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    long_name = "a" * 245 + ".pcap.gz"       # 253 chars
+    deriv +'.txt' = 257 > 255
     (src / long_name).write_bytes(gzip.compress(_pcap_member_bytes()))
     (src / "ok.log.gz").write_bytes(gzip.compress(b"ip 10.0.0.9\n"))
     stats = _run(src, dst)                    # must NOT raise
@@ -683,7 +743,9 @@ def test_bad_name_colon_at_index_one_is_not_drive_absolute():
 
 
 def test_posix_colon_member_survives_repack_and_is_scrubbed(tmp_path: Path):
-    src = tmp_path / "src"; dst = tmp_path / "dst"; src.mkdir()
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
     (src / "bundle.tar").write_bytes(_targz_bytes(
         {"a:notes.txt": "contact frank@corp.com ip 10.7.7.7\n"}, comp=""))
     stats = _run(src, dst)
@@ -700,7 +762,9 @@ def test_posix_colon_member_survives_repack_and_is_scrubbed(tmp_path: Path):
 # archive's running max_out_bytes budget, so total produced text stays bounded.
 
 def test_nested_expansion_debited_against_budget(tmp_path: Path):
-    src = tmp_path / "src"; dst = tmp_path / "dst"; src.mkdir()
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
     pcap = _pcap_member_bytes()
     members = {f"cap{i}.pcap": pcap for i in range(6)}
     (src / "caps.zip").write_bytes(_zip_bytes(members))

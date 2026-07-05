@@ -107,7 +107,8 @@ def dummy_handler():
 # ExtractError -> copy-through + flag preserves the OLD behaviour.
 
 def test_extracterror_falls_back_to_copy_through_and_flag(tmp_path: Path):
-    src = tmp_path / "src"; dst = tmp_path / "dst"
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
     src.mkdir()
     # .pcap -> stub raises ExtractError -> exact old copy-through+flag path.
     (src / "cap.pcap").write_bytes(b"\xd4\xc3\xb2\xa1\x00\x01 ip 10.0.0.9 here")
@@ -130,7 +131,8 @@ def test_extracterror_falls_back_to_copy_through_and_flag(tmp_path: Path):
 
 
 def test_extraction_success_records_stats_and_writes_derivative(tmp_path, dummy_handler):
-    src = tmp_path / "src"; dst = tmp_path / "dst"
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
     src.mkdir()
     (src / "note.dummy").write_bytes(b"contact a@b.com at 10.0.0.9")
     amap = AliasMap()
@@ -153,7 +155,8 @@ def test_extraction_success_records_stats_and_writes_derivative(tmp_path, dummy_
 
 
 def test_extract_disable_by_name_falls_back(tmp_path, dummy_handler):
-    src = tmp_path / "src"; dst = tmp_path / "dst"
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
     src.mkdir()
     (src / "note.dummy").write_bytes(b"ip 10.0.0.9")
     stats = process_tree(src, dst, build_active(), AliasMap(), max_bytes=10**9,
@@ -170,7 +173,8 @@ def test_extract_disable_by_name_falls_back(tmp_path, dummy_handler):
 # --no-extract / extract disabled entirely.
 
 def test_no_extract_restores_old_behavior(tmp_path, dummy_handler):
-    src = tmp_path / "src"; dst = tmp_path / "dst"
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
     src.mkdir()
     (src / "cap.pcap").write_bytes(b"\xd4\xc3\xb2\xa1\x00\x01 ip 10.0.0.9")
     stats = process_tree(src, dst, build_active(), AliasMap(), max_bytes=10**9,
@@ -257,7 +261,8 @@ def test_extract_disable_lists_union_across_layers(tmp_path: Path):
 # report + manifest sections for extracted files.
 
 def test_report_and_manifest_record_extracted(tmp_path, dummy_handler):
-    src = tmp_path / "src"; dst = tmp_path / "dst"
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
     src.mkdir()
     (src / "note.dummy").write_bytes(b"ip 10.0.0.9 mail a@b.com")
     amap = AliasMap()
@@ -294,7 +299,8 @@ def test_derivative_name_collision_with_sibling_preserves_both(tmp_path, dummy_h
     # old export-to-text hint told operators to create) silently overwrote one
     # of them and misattributed the manifest. Both outputs must now survive with
     # distinct content and correct per-source manifest hashes.
-    src = tmp_path / "src"; dst = tmp_path / "dst"
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
     src.mkdir()
     (src / "note.dummy").write_bytes(b"dissected ip 10.0.0.9")
     (src / "note.dummy.txt").write_text("plain sibling mail a@b.com\n",
@@ -328,7 +334,8 @@ def test_derivative_collision_guard_is_case_insensitive(tmp_path, dummy_handler)
     # are the SAME file, so a case-SENSITIVE collision check let the derivative
     # silently clobber the sibling and misattribute the manifest. The guard must
     # detect the case-folded collision and relocate the derivative.
-    src = tmp_path / "src"; dst = tmp_path / "dst"
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
     src.mkdir()
     (src / "X.DUMMY").write_bytes(b"dissected ip 10.0.0.9")
     (src / "x.dummy.txt").write_text("plain sibling mail a@b.com\n", encoding="utf-8")

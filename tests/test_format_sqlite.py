@@ -433,7 +433,8 @@ def test_walker_sqlite_write_enametoolong_falls_back_to_copy_flag(tmp_path: Path
     src = tmp_path / "src"
     dst = tmp_path / "dst"
     src.mkdir()
-    long_name = "d" * 250 + ".db"            # 253 chars; + ".txt" = 257 > 255
+    long_name = "d" * 250 + ".db"            # 253 chars
+    + ".txt" = 257 > 255
     # Build under a short name first (sqlite's transient ``-journal`` sidecar
     # would itself exceed NAME_MAX for the long name), then rename into place —
     # the read-only immutable open the handler uses creates no sidecar.

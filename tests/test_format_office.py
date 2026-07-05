@@ -405,7 +405,9 @@ def test_corrupt_member_bad_crc_raises_extracterror(tmp_path: Path):
 
 
 def test_walker_corrupt_member_falls_back_to_copy_flag(tmp_path: Path):
-    src = tmp_path / "src"; dst = tmp_path / "dst"; src.mkdir()
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
     doc = src / "torn.docx"
     make_docx(doc, ["contact alice@example.com from 10.0.0.9"])
     _corrupt_member(doc, "word/document.xml")
@@ -514,7 +516,8 @@ def test_walker_office_write_enametoolong_falls_back_to_copy_flag(tmp_path: Path
     src = tmp_path / "src"
     dst = tmp_path / "dst"
     src.mkdir()
-    long_name = "d" * 249 + ".docx"          # 254 chars; + ".txt" = 258 > 255
+    long_name = "d" * 249 + ".docx"          # 254 chars
+    + ".txt" = 258 > 255
     make_docx(src / long_name, ["email jack@corp.com"])
     # A second, normal doc after it proves the run does NOT abort mid-way.
     make_docx(src / "ok.docx", ["email jill@corp.com"])

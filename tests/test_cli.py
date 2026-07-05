@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from piiscrub.cli import main
 
 
@@ -137,12 +139,9 @@ def test_unknown_extract_disable_name_rejected():
     # silently ignoring it would leave extraction ON and drop the source
     # binaries the operator meant to preserve.
     for bad in ("pacp", "sqlite3"):
-        try:
+        with pytest.raises(SystemExit) as ei:
             _merge_cli_into_config(Config(), _ns(extract_disable=[bad]))
-        except SystemExit as e:
-            assert "unknown extractor" in str(e.code) and bad in str(e.code)
-            continue
-        raise AssertionError(f"expected SystemExit for --extract-disable {bad}")
+        assert "unknown extractor" in str(ei.value.code) and bad in str(ei.value.code)
 
 
 def test_known_extract_disable_name_accepted():
@@ -155,9 +154,6 @@ def test_unknown_extract_disable_from_config_table_rejected():
     # not only the CLI flag.
     cfg = Config()
     cfg.extract.disable = {"office", "bogus"}
-    try:
+    with pytest.raises(SystemExit) as ei:
         _merge_cli_into_config(cfg, _ns())
-    except SystemExit as e:
-        assert "bogus" in str(e.code)
-        return
-    raise AssertionError("expected SystemExit for a bad [extract].disable name")
+    assert "bogus" in str(ei.value.code)

@@ -14,7 +14,8 @@ blobs are committed. The core contract under test:
 * every supported link type (Ethernet + VLAN, SLL, SLL2, raw IP, Null/Loopback)
   reaches L3/L4;
 * limits (max_out_bytes) trip ExtractError; scan (write=False) drives scrub but
-  writes nothing; a shared AliasMap gives the same alias across sources.
+  writes nothing
+  a shared AliasMap gives the same alias across sources.
 """
 
 from __future__ import annotations
