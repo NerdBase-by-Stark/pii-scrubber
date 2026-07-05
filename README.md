@@ -48,8 +48,13 @@ small and low-AV-risk.
 - **Optional LLM second pass** — off by default; flags residual PII the regex missed,
   reading only the **already-stripped** text. Local model by default, cloud endpoints
   hard-gated, API key by env-var only. See below.
-- **Robust file handling** — encoding/BOM detection, binary passthrough, adaptive
-  streaming for multi-GB files (output byte-identical to whole-file), progress bar.
+- **Format extraction (ON by default)** — `.pcap`/`.pcapng`/`.cap`, `.zip`/`.tar[.gz|.bz2|.xz]`/`.tgz`/`.gz`/`.bz2`/`.xz`,
+  `.docx`/`.xlsx`/`.pptx`, and `.db`/`.sqlite`/`.sqlite3` are dissected or repacked
+  into scrubbed derivatives instead of copied through raw; `--no-extract` restores
+  plain copy-through, `--extract-disable NAME` opts out one format at a time.
+- **Robust file handling** — encoding/BOM detection, adaptive streaming for
+  multi-GB files (output byte-identical to whole-file), progress bar; binary
+  formats with no extractor are still copied through and flagged.
 - **CLI *and* GUI** — a stdlib-only CLI plus an optional PySide6 folder-picker GUI;
   both ship as portable Windows `.exe`s built in CI.
 
@@ -86,7 +91,7 @@ PYTHONPATH=src python -m piiscrub scan ./logs
 |---------|--------------|
 | `scan SRC` | **Dry-run.** Detects PII and writes a preview report to `SRC/_pii/scan_report.{html,json}`. Writes **no** stripped files and **no** decode map. |
 | `strip SRC DST` | Writes a stripped mirror into `DST`; writes the decode map + report + chain-of-custody manifest into `SRC/_pii/` (or the project vault); then **auto-runs verify**. |
-| `verify DST` | Re-scans a stripped tree for residual PII shapes and stray sidecars. **Fail-closed** — exits `10` on any finding. |
+| `verify DST` | Re-scans a stripped tree for residual PII shapes and stray sidecars, recursing into repacked archives when extraction is on. **Fail-closed** — exits `10` on any finding. |
 | `reverse IN OUT --map M` | Rehydrates aliases in `IN` back to originals using a decode map, writing `OUT`. |
 | `reconcile IN OUT --project P` | Rewrites an already-stripped tree to current canonical aliases (e.g. `<IP_1>` → `<DEV0001.IP_1>`) and writes a **new** output tree. Custody-safe: the input is never modified. |
 | `--selftest` | Compiles every detector and runs a tiny tokenise → reverse → re-scan round-trip; exits `0` on success. CI uses this to prove a frozen `.exe` actually runs. |
@@ -189,6 +194,7 @@ the config:
 --enable D          --disable D         (repeatable detector toggles)
 --include GLOB      --exclude GLOB      (repeatable globs)
 --max-bytes N       --stream-threshold N
+--no-extract        --extract-disable NAME   (repeatable; format extraction toggles)
 ```
 
 ---

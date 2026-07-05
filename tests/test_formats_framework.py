@@ -362,3 +362,103 @@ def test_derivative_collision_guard_is_case_insensitive(tmp_path, dummy_handler)
     assert rec_deriv["output_file"] == deriv_rec.out_rel
     assert rec_deriv["output_sha256"] == manifest_mod.hash_file(dst / deriv_rec.out_rel)
     assert rec_plain["output_sha256"] == manifest_mod.hash_file(dst / "x.dummy.txt")
+
+
+# ----------------------------------------------------------------------
+# Audit round-3: derivative collision must be resolved BEFORE the handler writes.
+# On a case-INSENSITIVE filesystem, if the handler wrote its natural name first,
+# it would already have truncated a case-differing sibling that sorted first; the
+# post-write relocation cannot undo that. The walker now STAGES the handler's
+# output in a private temp dir and places it on the resolved-unique path itself,
+# so the handler never writes into DST directly.
+
+class _CapturingDummyHandler:
+    """Like _DummyHandler but records the ``out_path`` the walker handed it."""
+
+    name = "dummy"
+    suffixes = (".dummy",)
+
+    def __init__(self) -> None:
+        self.out_paths: list[Path | None] = []
+
+    def process(self, path, rel, out_path, scrub, *, write, limits):
+        self.out_paths.append(out_path)
+        text = path.read_bytes().decode("latin-1")
+        scrubbed, n = scrub(f"{rel}!body", text)
+        if write and out_path is not None:
+            deriv = out_path.parent / (out_path.name + ".txt")
+            deriv.parent.mkdir(parents=True, exist_ok=True)
+            deriv.write_text(scrubbed, encoding="utf-8")
+        return ExtractOutcome(kind="derivative", out_rel=rel + ".txt",
+                              replacements=n)
+
+
+@pytest.fixture
+def capturing_handler():
+    from piiscrub.formats import _BY_NAME, _BY_SUFFIX
+    h = register(_CapturingDummyHandler())
+    try:
+        yield h
+    finally:
+        _BY_NAME.pop("dummy", None)
+        _BY_SUFFIX.pop(".dummy", None)
+
+
+def test_handler_output_is_staged_not_written_into_dst_directly(tmp_path,
+                                                                capturing_handler):
+    # The out_path handed to the handler must NOT be ``dst/rel`` — if it were, the
+    # handler's write of ``dst/rel+suffix`` would clobber a case-differing sibling
+    # on a case-insensitive FS before the collision could be resolved. It must be
+    # a private staging path so the walker can place the result itself.
+    src = tmp_path / "src"; dst = tmp_path / "dst"
+    src.mkdir()
+    (src / "note.dummy").write_bytes(b"ip 10.0.0.9")
+    process_tree(src, dst, build_active(), AliasMap(), max_bytes=10 ** 9,
+                 write=True, exclude_dirs=set())
+    out_path = capturing_handler.out_paths[0]
+    assert out_path is not None
+    # Not the natural DST target...
+    assert out_path != dst / "note.dummy"
+    assert out_path.parent != dst
+    # ...but under a private staging dir, from which the walker relocates it.
+    assert out_path.parent.name.startswith(".piiscrub-stage-")
+    # And the derivative still lands at its final DST name.
+    assert (dst / "note.dummy.txt").exists()
+
+
+def test_sibling_first_casefold_collision_preserves_both(tmp_path,
+                                                         capturing_handler):
+    # The sibling-first variant the post-write relocation could NOT handle on a
+    # case-insensitive FS: a plain 'CAP.DUMMY.TXT' sorts before the producer
+    # 'cap.dummy' (case-sensitive rglob order), so it is written first. Staging
+    # ensures the producer's derivative is placed on a collision-resolved name
+    # instead of overwriting that sibling.
+    src = tmp_path / "src"; dst = tmp_path / "dst"
+    src.mkdir()
+    (src / "CAP.DUMMY.TXT").write_text("plain sibling mail a@b.com\n",
+                                       encoding="utf-8")
+    (src / "cap.dummy").write_bytes(b"dissected ip 10.0.0.9")
+    stats = process_tree(src, dst, build_active(), AliasMap(), max_bytes=10 ** 9,
+                         write=True, exclude_dirs=set())
+
+    # The plain sibling keeps its exact name and scrubbed content.
+    plain = (dst / "CAP.DUMMY.TXT").read_text()
+    assert "a@b.com" not in plain and "<EMAIL_1>" in plain
+    # The derivative is relocated off the colliding name, with its own content.
+    deriv_rec = next(r for r in stats.extracted if r.rel == "cap.dummy")
+    assert deriv_rec.out_rel.casefold() != "cap.dummy.txt"
+    assert deriv_rec.out_rel.endswith(".dup1")
+    deriv_body = (dst / deriv_rec.out_rel).read_text()
+    assert "10.0.0.9" not in deriv_body and "<IP_1>" in deriv_body
+    assert any("collides" in w for w in stats.warnings)
+
+    # Manifest attributes each output to the right source (distinct hashes).
+    manifest = manifest_mod.build_manifest(src, dst, stats, timestamp="t",
+                                           version="v")
+    rec_deriv = next(r for r in manifest["files"] if r["file"] == "cap.dummy")
+    rec_plain = next(r for r in manifest["files"] if r["file"] == "CAP.DUMMY.TXT")
+    assert rec_deriv["output_sha256"] == manifest_mod.hash_file(
+        dst / deriv_rec.out_rel)
+    assert rec_plain["output_sha256"] == manifest_mod.hash_file(
+        dst / "CAP.DUMMY.TXT")
+    assert rec_deriv["output_sha256"] != rec_plain["output_sha256"]

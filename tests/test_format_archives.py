@@ -786,3 +786,136 @@ def test_nested_expansion_debited_against_budget(tmp_path: Path):
     assert stats2.files_extracted == 1
     with zipfile.ZipFile(dst2 / "caps.zip") as z:
         assert sorted(z.namelist()) == sorted(f"cap{i}.pcap.txt" for i in range(6))
+
+
+# ======================================================================
+# Audit round-3 regression tests.
+
+# --- Fix (major): verify must SCAN readable text members whose stored name is
+# absolute or contains '..'. The _bad_name guard belongs only on the WRITE path;
+# skipping bad-named members on the read-only verify path is fail-OPEN — the
+# copy+flag fallback places the ORIGINAL archive (bad names and all) into DST, so
+# raw PII under '/abs/leak.txt' or '../escape.txt' would pass verify as clean.
+
+def test_verify_scans_bad_named_text_member_in_zip(tmp_path: Path):
+    dst = tmp_path / "dst"
+    dst.mkdir()
+    (dst / "orig.zip").write_bytes(_zip_bytes({
+        "/abs/leak.txt": "carol@evil.com 203.0.113.9\n",
+        "../escape.txt": "dan@evil.com 203.0.113.8\n",
+        "safe.txt": "clean\n",
+    }))
+    res = audit.verify_tree(dst, build_active())
+    assert res["clean"] is False
+    files = {leak["file"] for leak in res["leaks"]}
+    cats = {leak["category"] for leak in res["leaks"]}
+    assert "email" in cats and "ipv4" in cats
+    # BOTH bad-named members were scanned (not skipped).
+    assert "orig.zip!/abs/leak.txt" in files
+    assert "orig.zip!../escape.txt" in files
+
+
+def test_verify_scans_bad_named_text_member_in_tar(tmp_path: Path):
+    dst = tmp_path / "dst"
+    dst.mkdir()
+    (dst / "orig.tar").write_bytes(_targz_bytes({
+        "../escape.txt": "erin@evil.com 203.0.113.7\n",
+    }, comp=""))
+    res = audit.verify_tree(dst, build_active())
+    assert res["clean"] is False
+    files = {leak["file"] for leak in res["leaks"]}
+    assert "orig.tar!../escape.txt" in files
+
+
+def test_safe_named_member_still_caught_control(tmp_path: Path):
+    # Control: the identical content under a safe name is (and was) caught — the
+    # fix only stops bad names from being an escape hatch, not the normal path.
+    dst = tmp_path / "dst"
+    dst.mkdir()
+    (dst / "orig.zip").write_bytes(_zip_bytes({
+        "abs/leak.txt": "carol@evil.com 203.0.113.9\n"}))
+    res = audit.verify_tree(dst, build_active())
+    assert res["clean"] is False
+    assert "orig.zip!abs/leak.txt" in {leak["file"] for leak in res["leaks"]}
+
+
+# --- Fix (minor): scan (write=False) must reflect what strip does. A nested
+# handler's EXPANDED output was only measured in write mode, so scan skipped the
+# expansion budget debit and reported 'extracted' for an archive strip actually
+# copies+flags. Scan and strip must now agree.
+
+def test_scan_matches_strip_for_expanding_archive(tmp_path: Path):
+    src = tmp_path / "src"
+    src.mkdir()
+    pcap = _pcap_member_bytes()
+    (src / "caps.zip").write_bytes(_zip_bytes(
+        {f"cap{i}.pcap": pcap for i in range(6)}))
+    raw_sum = 6 * len(pcap)
+    cap = raw_sum + (len(pcap) // 2)          # fits raw, not the expanded text
+    cfg = ExtractConfig(limits=ExtractLimits(max_out_bytes=cap))
+
+    strip = _run(src, tmp_path / "dst", extract=cfg)
+    scan = process_tree(src, None, build_active(), AliasMap(), max_bytes=10 ** 9,
+                        write=False, exclude_dirs=set(), extract=cfg)
+
+    # Strip copies+flags (expansion trips max_out_bytes); scan must say the SAME,
+    # not advertise a scrubbed repack it cannot actually produce.
+    assert strip.files_extracted == 0 and strip.files_copied == 1
+    assert scan.files_extracted == strip.files_extracted
+    assert scan.files_copied == strip.files_copied
+
+
+# --- Fix (minor): a tar repack must not carry a symlink/hardlink whose target is
+# absolute or escapes the archive root — that re-arms the path-traversal the
+# member-name guard blocks (a follow-links extractor writes outside the tree).
+
+def _tar_with_link(linkname: str, *, link_type: bytes, link_name: str = "logs",
+                   extra: dict[str, str] | None = None) -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as t:
+        ti = tarfile.TarInfo(link_name)
+        ti.type = link_type
+        ti.linkname = linkname
+        t.addfile(ti)                        # link members carry no data
+        for name, body in (extra or {}).items():
+            raw = body.encode("utf-8")
+            ri = tarfile.TarInfo(name)
+            ri.size = len(raw)
+            t.addfile(ri, io.BytesIO(raw))
+    return buf.getvalue()
+
+
+@pytest.mark.parametrize("linkname", ["/etc", "../../../../etc"])
+@pytest.mark.parametrize("link_type", [tarfile.SYMTYPE, tarfile.LNKTYPE])
+def test_tar_unsafe_link_target_skipped_and_flagged(tmp_path: Path, linkname,
+                                                    link_type):
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    # The finding's exploit shape: a link 'logs' -> outside + a regular member
+    # that would be written THROUGH the link on extraction.
+    (src / "links.tar").write_bytes(_tar_with_link(
+        linkname, link_type=link_type,
+        extra={"readme.txt": "ip 10.0.0.9\n"}))
+    stats = _run(src, dst)
+    assert stats.files_extracted == 1
+    with tarfile.open(dst / "links.tar") as t:
+        names = t.getnames()
+    assert "logs" not in names               # unsafe link NOT repacked
+    assert "readme.txt" in names             # the safe file still repacked
+    assert any("logs" in w and "unsafe link target" in w for w in stats.warnings)
+
+
+def test_tar_safe_symlink_carried_through(tmp_path: Path):
+    # Control: an in-tree relative link target is safe and is faithfully repacked.
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    (src / "links.tar").write_bytes(_tar_with_link(
+        "readme.txt", link_type=tarfile.SYMTYPE, link_name="here",
+        extra={"readme.txt": "ip 10.0.0.9\n"}))
+    stats = _run(src, dst)
+    with tarfile.open(dst / "links.tar") as t:
+        m = t.getmember("here")
+        assert m.issym() and m.linkname == "readme.txt"
+    assert not any("unsafe link target" in w for w in stats.warnings)

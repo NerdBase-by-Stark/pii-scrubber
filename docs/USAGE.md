@@ -332,6 +332,82 @@ max_depth = 3                  # nested-archive recursion cap
 max_members = 50000            # member / row cap
 ```
 
+### Worked example — a folder with a pcap and a zip
+
+Say `./evidence` contains a packet capture and an archive of logs, alongside
+plain text:
+
+```
+evidence/
+├── capture.pcap      # a TCP flow with an HTTP request (email + URL in the payload)
+└── logs.zip          # contains app.log (an IP + email) and a screenshot.png
+```
+
+```bash
+piiscrub strip ./evidence ./evidence-clean
+```
+
+Sample stdout (same shape as any other `strip`):
+
+```json
+{
+  "mode": "strip",
+  "files_processed": 2,
+  "files_copied_unprocessed": 0,
+  "replacements": 6,
+  "entities": 0,
+  "decode_map": "/.../evidence/_pii/decode.json",
+  "report": "/.../evidence/_pii/report.html",
+  "manifest": "/.../evidence/_pii/manifest.json",
+  "run_digest": "7c1e4a9b...",
+  "verify": "PASS"
+}
+```
+
+Resulting layout — note `capture.pcap` becomes a `.txt` derivative and
+`logs.zip` is repacked under its **original name** (the raw `.pcap` is never
+copied into the shareable tree):
+
+```
+evidence-clean/
+├── capture.pcap.txt   # scrubbed dissection, see below
+└── logs.zip           # repacked: app.log scrubbed, screenshot.png copied + flagged
+```
+
+`capture.pcap.txt` (excerpt — every address/name/string tokenised, no raw hex):
+
+```
+# packet 1 ts=2026-07-05T09:12:04.000000Z caplen=74 origlen=74
+eth <MAC_1> -> <MAC_2> type=0x0800
+ipv4 <IP_1> -> <IP_2> proto=6 ttl=64
+tcp 51000 -> 80 flags=PA len=34
+payload "GET /x?u=<EMAIL_1> HTTP/1.1"
+payload "<URL_1>"
+```
+
+`logs.zip`'s `app.log` member is scrubbed the same way any top-level text file
+would be (`10.0.0.5 alice@example.com` → `<IP_1> <EMAIL_1>`); `screenshot.png`
+has no extractor, so it is copied into the repacked zip unchanged and the
+report flags it "may contain PII", same as a top-level binary would be.
+
+The report's `extracted` section (aliases/counts only, never raw values)
+records both:
+
+```json
+"extracted": [
+  {"file": "capture.pcap", "output_file": "capture.pcap.txt",
+   "kind": "derivative", "replacements": 4,
+   "members_processed": 0, "members_copied": 0},
+  {"file": "logs.zip", "output_file": "logs.zip",
+   "kind": "repack", "replacements": 2,
+   "members_processed": 1, "members_copied": 1}
+]
+```
+
+To reverse: `capture.pcap.txt` is plain text, so `piiscrub reverse` works on it
+directly; for `logs.zip`, unzip the repacked archive and run `reverse` on the
+extracted `app.log` with the same decode map.
+
 ### Reversing extracted output
 
 A `.txt` / `.csv` derivative is plain text + aliases, so `piiscrub reverse`

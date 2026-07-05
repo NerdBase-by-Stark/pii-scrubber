@@ -239,3 +239,14 @@ Stdlib `struct` parsing. Support:
    modules only.
 4. README/USAGE updated; the old "export to text first" hints retained only
    for evtx/etl/pdf.
+
+## Build phases
+
+* **Phase done (2026-07-05):** `pcap`/`archive`/`office`/`sqlite` handlers,
+  walker/CLI/config wiring (`--no-extract`, `--extract-disable`, `[extract]`),
+  verify archive-recursion, and manifest/report `extracted` section all landed
+  and are exercised by the test suite. README.md and docs/USAGE.md updated to
+  document the new default behaviour, config table, limits, and a worked
+  pcap + zip example. `evtx`/`etl`/`pdf`/`msg` remain out of scope per decision
+  #8 above. Full suite: `PYTHONPATH=src python -m pytest tests/ -q` →
+  **293 passed**.
