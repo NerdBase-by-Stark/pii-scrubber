@@ -919,3 +919,148 @@ def test_tar_safe_symlink_carried_through(tmp_path: Path):
         m = t.getmember("here")
         assert m.issym() and m.linkname == "readme.txt"
     assert not any("unsafe link target" in w for w in stats.warnings)
+
+
+# ======================================================================
+# Nested-handler ExtractError fallback: a member whose nested handler fails
+# but whose bytes decode as TEXT is scrubbed as plain text (mirroring the
+# walker's top-level rule for structured sources), never copied in raw; only
+# an undecodable member keeps the copy-in-unchanged + flag behaviour.
+# (Regression: a parse-failing .json member shipped raw PII in the repack.)
+
+def test_broken_json_member_falls_back_to_text_scrub(tmp_path: Path):
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    (src / "bundle.zip").write_bytes(_zip_bytes({
+        "broken.json": '{"host": "192.0.2.99", oops not json\n'}))
+    stats = _run(src, dst)
+
+    assert stats.files_extracted == 1
+    rec = stats.extracted[0]
+    assert rec.members_processed == 1 and rec.members_copied == 0
+    with zipfile.ZipFile(dst / "bundle.zip") as z:
+        body = z.read("broken.json").decode("utf-8")   # keeps its own name
+    assert "192.0.2.99" not in body and "<IP_1>" in body
+    warn = next(w for w in stats.warnings if "broken.json" in w)
+    assert "nested extraction failed" in warn and "scrubbed as plain text" in warn
+    assert "malformed JSON" in warn                    # parse failure still shown
+
+
+def test_corrupt_binary_pcap_member_still_copied_and_flagged(tmp_path: Path):
+    # A corrupt BINARY member (bad pcap magic, NUL-laden bytes) must keep the
+    # old copy-in-unchanged + flag behaviour — no text to fall back to.
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    bad = b"\x00\x01\x02\x03 bad magic 10.9.8.7 \x00\xfe"
+    (src / "caps.zip").write_bytes(_zip_bytes({
+        "cut.pcap": bad, "app.log": "ip 10.0.0.9\n"}))
+    stats = _run(src, dst)
+
+    rec = stats.extracted[0]
+    assert rec.members_processed == 1 and rec.members_copied == 1
+    with zipfile.ZipFile(dst / "caps.zip") as z:
+        assert z.read("cut.pcap") == bad               # untouched, raw bytes kept
+        assert "10.0.0.9" not in z.read("app.log").decode("utf-8")
+    warn = next(w for w in stats.warnings if "cut.pcap" in w)
+    assert "copied unchanged (may contain PII)" in warn
+
+
+def test_undecodable_csv_member_copied_and_flagged(tmp_path: Path):
+    # A .csv member whose bytes do NOT decode as text cannot use the fallback:
+    # copy in unchanged + flag, exactly as before.
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    bad = b"\x00\xffip,10.0.0.9\x00\xfe"
+    (src / "data.zip").write_bytes(_zip_bytes({"table.csv": bad}))
+    stats = _run(src, dst)
+
+    rec = stats.extracted[0]
+    assert rec.members_processed == 0 and rec.members_copied == 1
+    with zipfile.ZipFile(dst / "data.zip") as z:
+        assert z.read("table.csv") == bad
+    warn = next(w for w in stats.warnings if "table.csv" in w)
+    assert "copied unchanged (may contain PII)" in warn
+
+
+def test_decodable_broken_csv_member_falls_back_to_text_scrub(tmp_path: Path):
+    # A .csv member that IS text but makes the structured handler raise (a
+    # field larger than csv.field_size_limit() -> "malformed CSV") must be
+    # text-scrubbed into the repack, not copied through raw.
+    import csv as _csv
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    giant = '"' + "a" * (_csv.field_size_limit() + 100) + '",203.0.113.55\n'
+    (src / "data.zip").write_bytes(_zip_bytes({"table.csv": giant}))
+    stats = _run(src, dst)
+
+    rec = stats.extracted[0]
+    assert rec.members_processed == 1 and rec.members_copied == 0
+    with zipfile.ZipFile(dst / "data.zip") as z:
+        body = z.read("table.csv").decode("utf-8")
+    assert "203.0.113.55" not in body and "<IP_1>" in body
+    warn = next(w for w in stats.warnings if "table.csv" in w)
+    assert "scrubbed as plain text" in warn and "malformed CSV" in warn
+
+
+def test_broken_json_inside_nested_zip_scrubbed_at_depth(tmp_path: Path):
+    # The fallback applies at ANY nesting depth: a parse-failing .json inside
+    # a zip inside a zip is still text-scrubbed, never repacked raw.
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    inner = _zip_bytes({"deep/broken.json": '{"ip": "203.0.113.77", nope\n'})
+    (src / "outer.zip").write_bytes(_zip_bytes({"inner.zip": inner}))
+    stats = _run(src, dst)
+
+    assert stats.files_extracted == 1 and stats.replacements >= 1
+    with zipfile.ZipFile(dst / "outer.zip") as z:
+        nz = z.read("inner.zip")
+    with zipfile.ZipFile(io.BytesIO(nz)) as z:          # still a valid nested zip
+        body = z.read("deep/broken.json").decode("utf-8")
+    assert "203.0.113.77" not in body and "<IP_1>" in body
+
+
+# ======================================================================
+# verify must SCAN structured-suffix members (.csv/.json/.jsonl) inside DST
+# archives — they are TEXT, not supported-binary. Skipping them because their
+# suffix has a handler was fail-OPEN: a copied-through archive (encrypted /
+# corrupt / cap-tripped fallback) lands in DST with its ORIGINAL members, so a
+# readable .json member holding raw PII passed verify as clean.
+
+def test_verify_scans_structured_json_member_in_zip(tmp_path: Path):
+    dst = tmp_path / "dst"
+    dst.mkdir()
+    (dst / "orig.zip").write_bytes(_zip_bytes({
+        "conf.json": '{"host": "192.0.2.99", "mail": "leak@evil.com"}\n'}))
+    res = audit.verify_tree(dst, build_active())
+    assert res["clean"] is False
+    files = {leak["file"] for leak in res["leaks"]}
+    cats = {leak["category"] for leak in res["leaks"]}
+    assert "orig.zip!conf.json" in files
+    assert "ipv4" in cats and "email" in cats
+
+
+def test_verify_clean_when_json_member_holds_aliases_only(tmp_path: Path):
+    # Control: a properly scrubbed .json member (aliases only) stays clean.
+    dst = tmp_path / "dst"
+    dst.mkdir()
+    (dst / "done.zip").write_bytes(_zip_bytes({
+        "conf.json": '{"host": "<IP_1>", "mail": "<EMAIL_1>"}\n'}))
+    res = audit.verify_tree(dst, build_active())
+    assert res["clean"] is True and res["leaks"] == []
+
+
+def test_verify_binary_pcap_member_still_skipped(tmp_path: Path):
+    # Contract unchanged for genuinely binary members: a raw .pcap member was
+    # copied+flagged at strip time and is NOT re-flagged by verify, even when
+    # its payload bytes happen to contain an IP-looking printable string.
+    dst = tmp_path / "dst"
+    dst.mkdir()
+    (dst / "caps.zip").write_bytes(_zip_bytes({
+        "cap.pcap": _pcap_bytes(b"payload 203.0.113.9 raw")}))
+    res = audit.verify_tree(dst, build_active())
+    assert res["clean"] is True and res["leaks"] == []

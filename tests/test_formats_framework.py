@@ -47,8 +47,8 @@ def test_registry_lookup_and_names():
         assert h is not None and h.name == name
 
     assert get_handler(".txt") is None and get_handler(".log") is None
-    assert handler_names() == {"pcap", "archive", "office", "sqlite"}
-    assert {".pcap", ".zip", ".docx", ".db"} <= handler_suffixes()
+    assert handler_names() == {"pcap", "archive", "office", "sqlite", "structured"}
+    assert {".pcap", ".zip", ".docx", ".db", ".csv"} <= handler_suffixes()
 
 
 def test_registry_lookup_is_case_insensitive():

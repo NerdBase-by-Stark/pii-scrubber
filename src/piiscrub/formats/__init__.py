@@ -76,7 +76,8 @@ def handler_names() -> frozenset[str]:
 # Import the concrete handlers so they self-register. These are stubs today
 # (their ``process`` raises ExtractError("not implemented yet")); replacing a
 # module body is the only change needed to light one up.
-from . import pcap as _pcap          # noqa: E402,F401
-from . import archives as _archives  # noqa: E402,F401
-from . import office as _office      # noqa: E402,F401
-from . import sqlitedb as _sqlitedb  # noqa: E402,F401
+from . import pcap as _pcap            # noqa: E402,F401
+from . import archives as _archives    # noqa: E402,F401
+from . import office as _office        # noqa: E402,F401
+from . import sqlitedb as _sqlitedb    # noqa: E402,F401
+from . import structured as _structured  # noqa: E402,F401
