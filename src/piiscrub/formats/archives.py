@@ -94,6 +94,21 @@ def _strip_comp_suffix(name: str) -> str:
     return name
 
 
+def _unique_member_name(name: str, used: set[str]) -> str:
+    """Return ``name`` if free within this repack, else a ``.dupN`` variant.
+
+    A member's rewritten name can collide with another member's (e.g. a repack
+    of both ``x.pcap`` -> ``x.pcap.txt`` and a sibling plain ``x.pcap.txt``); two
+    entries with one name would silently drop content on extraction, so the
+    second claimant is renamed instead."""
+    if name not in used:
+        return name
+    i = 1
+    while f"{name}.dup{i}" in used:
+        i += 1
+    return f"{name}.dup{i}"
+
+
 def _bad_name(name: str) -> bool:
     """True if a member name is absolute or escapes the archive root (``..``).
 
@@ -220,6 +235,7 @@ def _handle_member(
     scrub: ScrubFn,
     limits: ExtractLimits,
     write: bool,
+    remaining_budget: int,
 ) -> tuple[str, bytes | None, bool, bool, int, list[str]]:
     """Apply the per-file decision tree to one archive member.
 
@@ -227,18 +243,29 @@ def _handle_member(
     warnings)``. ``out_data`` is None in scan mode. ``processed`` marks a member
     scrubbed as text or successfully nested-extracted; ``copied`` marks a binary
     member carried through unchanged + flagged.
+
+    ``remaining_budget`` is what is left of the source file's ``max_out_bytes``
+    after this archive's members read so far; a nested handler is capped to it so
+    total expanded text stays bounded ACROSS nesting, not reset per member.
     """
     from ..walker import BINARY_EXTS, decode_bytes  # deferred: avoids import cycle
 
     member_rel = f"{arch_rel}!{name}"
     suffix = Path(name).suffix.lower()
     handler = get_handler(suffix)
+    # Honor the run's per-format disable set for members exactly as the walker
+    # does for top-level files: a disabled extractor's member is copied through
+    # unchanged + flagged (never silently turned into a derivative), so the
+    # original binary member survives the repack.
+    if handler is not None and handler.name in limits.disable:
+        handler = None
 
     if handler is not None:
         nested_limits = ExtractLimits(
-            max_out_bytes=limits.max_out_bytes,
+            max_out_bytes=max(0, remaining_budget),
             max_depth=limits.max_depth - 1,
             max_members=limits.max_members,
+            disable=limits.disable,
         )
         try:
             out_name, out_data, _kind, reps = _run_nested(
@@ -250,7 +277,9 @@ def _handle_member(
                      f"copied unchanged (may contain PII)"])
         return out_name, out_data, True, False, reps, []
 
-    if suffix in BINARY_EXTS:
+    if suffix in BINARY_EXTS or get_handler(suffix) is not None:
+        # ``get_handler(...) is not None`` catches a DISABLED handler's suffix
+        # that is not in BINARY_EXTS (e.g. ``.sqlite3``): still binary, copy+flag.
         return (name, data if write else None, False, True, 0,
                 [f"member {name!r}: binary type, copied unchanged (may contain PII)"])
 
@@ -278,6 +307,7 @@ def _process_zip(path: Path, rel: str, out_path: Path | None,
     warnings: list[str] = []
     running = 0
     members_seen = 0
+    used_names: set[str] = set()
     zout = None
     tmp_path: str | None = None
     try:

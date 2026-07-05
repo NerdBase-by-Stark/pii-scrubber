@@ -54,13 +54,20 @@ class ExtractLimits:
     * ``max_depth`` — nested-archive recursion cap. Default 3.
     * ``max_members`` — member / row cap for archives and sqlite dumps.
       Default 50 000.
+    * ``disable`` — handler NAMES ("pcap"/"archive"/"office"/"sqlite") the run
+      disabled. Threaded through so an archive applies the SAME per-format
+      disable contract to its members as the walker applies at the top level (a
+      disabled extractor's members are copied through unchanged + flagged, never
+      silently turned into a derivative). Empty ⇒ nothing disabled.
 
-    Exceeding any limit raises :class:`ExtractError` (→ copy-through + flag).
+    Exceeding any size/depth/member limit raises :class:`ExtractError`
+    (→ copy-through + flag).
     """
 
     max_out_bytes: int = 512 * 1024 * 1024
     max_depth: int = 3
     max_members: int = 50_000
+    disable: frozenset[str] = frozenset()
 
 
 @dataclass

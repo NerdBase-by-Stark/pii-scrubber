@@ -17,9 +17,10 @@ from __future__ import annotations
 
 import codecs
 import fnmatch
+import os
 import shutil
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
@@ -413,6 +414,31 @@ def process_tree(
         extract_enabled = extract.enabled
         extract_disable = frozenset(extract.disable)
         extract_limits = extract.limits
+    # Handlers receive the disable set folded into their limits so an archive
+    # applies the SAME per-format disable contract to its members that the walker
+    # applies to top-level files (findings: disable ignored for archive members).
+    handler_limits = replace(extract_limits, disable=extract_disable)
+
+    # Output-namespace bookkeeping so a format derivative (``x.pcap`` ->
+    # ``x.pcap.txt``) can never silently clobber, or be clobbered by, a real
+    # sibling source file that already lives at that exact name (e.g. a plain
+    # ``x.pcap.txt`` created by the old export-to-text hint). Because a
+    # derivative name strictly EXTENDS its producer's rel, the producer always
+    # sorts before the colliding plain file; we relocate the derivative to a
+    # unique name (and warn) rather than lose either file or misattribute the
+    # manifest. ``reserved_rels`` is every source rel (any of which may be
+    # written at its own path); ``claimed_out_rels`` accrues derivative outputs.
+    reserved_rels = {rel for _p, rel, _s in candidates}
+    claimed_out_rels: set[str] = set()
+
+    def _unique_out_rel(desired: str) -> str:
+        taken = reserved_rels | claimed_out_rels
+        if desired not in taken:
+            return desired
+        i = 1
+        while f"{desired}.dup{i}" in taken:
+            i += 1
+        return f"{desired}.dup{i}"
 
     def _scrub(chunk_rel: str, text: str) -> tuple[str, int]:
         """The closure handed to every format handler: run the run's detectors/
@@ -443,7 +469,7 @@ def process_tree(
         if handler is not None and handler.name not in extract_disable:
             try:
                 outcome = handler.process(path, rel, out_path, _scrub,
-                                          write=write, limits=extract_limits)
+                                          write=write, limits=handler_limits)
             except ExtractError as e:
                 _copy_through(
                     rel, "binary",
@@ -455,15 +481,34 @@ def process_tree(
                 bytes_done_total += size
                 _emit(rel)
                 continue
+            # Guard the output namespace: a derivative whose name collides with a
+            # real source file (a repack keeps its own rel, which cannot collide)
+            # is relocated to a unique name so neither file is lost and the
+            # manifest attributes each output to the right source.
+            out_rel = outcome.out_rel
+            if outcome.kind == "derivative":
+                unique = _unique_out_rel(out_rel)
+                if unique != out_rel:
+                    stats.warnings.append(
+                        f"{rel}: derivative {out_rel!r} collides with an existing "
+                        f"file; written as {unique!r} instead")
+                    if write and dst is not None:
+                        produced = dst / out_rel
+                        if produced.exists():
+                            relocated = dst / unique
+                            relocated.parent.mkdir(parents=True, exist_ok=True)
+                            os.replace(produced, relocated)
+                    out_rel = unique
+                claimed_out_rels.add(out_rel)
             stats.extracted.append(ExtractRecord(
-                rel=rel, out_rel=outcome.out_rel, kind=outcome.kind,
+                rel=rel, out_rel=out_rel, kind=outcome.kind,
                 replacements=outcome.replacements,
                 members_processed=outcome.members_processed,
                 members_copied=outcome.members_copied,
             ))
             stats.per_file.append(FileStat(
                 rel, "extracted", replacements=outcome.replacements,
-                out_rel=outcome.out_rel))
+                out_rel=out_rel))
             stats.files_extracted += 1
             stats.replacements += outcome.replacements
             for w in outcome.warnings:
