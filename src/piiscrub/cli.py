@@ -57,6 +57,11 @@ def _merge_cli_into_config(cfg: Config, args: argparse.Namespace) -> Config:
         if args.stream_threshold <= 0:
             raise SystemExit("error: --stream-threshold must be > 0")
         cfg.stream_threshold = args.stream_threshold
+    # Format extraction toggles merge on top of the [extract] config table.
+    if getattr(args, "no_extract", False):
+        cfg.extract.enabled = False
+    if getattr(args, "extract_disable", None):
+        cfg.extract.disable |= set(args.extract_disable)
     return cfg
 
 
@@ -179,7 +184,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
                              include=cfg.include, exclude=cfg.exclude,
                              max_bytes=cfg.max_bytes, write=False, exclude_dirs={PII_DIRNAME},
                              stream_threshold=cfg.stream_threshold, progress=progress,
-                             post_pass=post_pass)
+                             post_pass=post_pass, extract=cfg.extract)
         pii_dir = src / PII_DIRNAME
         summary = build_summary(mode="scan", src=str(src), dst=None, timestamp=_now(),
                                 version=__version__, amap=amap, stats=stats,
@@ -266,10 +271,10 @@ def cmd_strip(args: argparse.Namespace) -> int:
                              include=cfg.include, exclude=cfg.exclude,
                              max_bytes=cfg.max_bytes, write=True, exclude_dirs={PII_DIRNAME},
                              stream_threshold=cfg.stream_threshold, progress=progress,
-                             post_pass=post_pass)
+                             post_pass=post_pass, extract=cfg.extract)
 
         manifest = manifest_mod.build_manifest(src, dst, stats, timestamp=ts, version=__version__)
-        audit = verify_tree(dst, detectors, cfg.allowlist_cf)
+        audit = verify_tree(dst, detectors, cfg.allowlist_cf, extract=cfg.extract)
         verify_status = "PASS" if audit["clean"] else "FAIL"
         summary = build_summary(mode="strip", src=str(src), dst=str(dst), timestamp=ts,
                                 version=__version__, amap=amap, stats=stats,
@@ -335,7 +340,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
     cfg = _resolve(args)
     detectors = build_active(disable=cfg.disable, enable=cfg.enable,
                              custom=cfg.custom, denylist=cfg.denylist)
-    audit = verify_tree(dst, detectors, cfg.allowlist_cf)
+    audit = verify_tree(dst, detectors, cfg.allowlist_cf, extract=cfg.extract)
     print(json.dumps({"clean": audit["clean"], "leak_count": len(audit["leaks"]),
                       "stray_sidecars": audit["stray_sidecars"],
                       "leaks": audit["leaks"][:50]}, indent=2))
@@ -477,6 +482,15 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--max-bytes", type=int, dest="max_bytes", help="hard skip files larger than N bytes (default: effectively off; huge files are streamed)")
         sp.add_argument("--stream-threshold", type=int, dest="stream_threshold", help="stream files larger than N bytes in chunks (default 50MB)")
         sp.add_argument("--no-progress", action="store_true", help="suppress the stderr progress bar")
+        # ---- format extraction (ON by default) ----
+        sp.add_argument("--no-extract", action="store_true", dest="no_extract",
+                        help="disable binary-format extraction (pcap/archive/office/"
+                             "sqlite); restores plain copy-through + flag. On verify, "
+                             "also skips archive recursion (weaker guarantee).")
+        sp.add_argument("--extract-disable", action="append", dest="extract_disable",
+                        metavar="NAME",
+                        help="disable one extractor by name (pcap|archive|office|"
+                             "sqlite); repeatable, merges over [extract].disable")
         # ---- optional LLM second pass (OFF unless --llm) ----
         sp.add_argument("--llm", action="store_true",
                         help="run an optional LLM second pass over the ALREADY-STRIPPED "

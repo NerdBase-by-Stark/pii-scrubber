@@ -21,11 +21,15 @@ import shutil
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from .engine import AliasMap, tokenize, tokenize_segment
 from .detectors import Detector
+from .formats import ExtractError, ExtractLimits, get_handler
 from .progress import ProgressCallback, ProgressEvent
+
+if TYPE_CHECKING:      # runtime-decoupled: only a duck-typed .enabled/.disable/.limits
+    from .config import ExtractConfig
 
 # Streaming controls (see process_tree).
 READ_BLOCK = 8 * 1024 * 1024   # raw bytes pulled per read for huge files
@@ -96,9 +100,25 @@ def _capture_export_hint(suffix: str) -> str:
 @dataclass
 class FileStat:
     rel: str
-    status: str           # "processed" | "binary" | "undecodable" | "oversize"
+    status: str           # "processed" | "extracted" | "binary" | "undecodable" | "oversize"
     encoding: str = ""
     replacements: int = 0
+    # For status == "extracted": the DST-relative path of the derivative /
+    # repacked output (differs from ``rel`` for derivatives, equals it for
+    # repacks). Empty ⇒ output shares ``rel`` (all non-extracted files).
+    out_rel: str = ""
+
+
+@dataclass
+class ExtractRecord:
+    """One source file a format handler turned into scrubbed output. Feeds the
+    report's "extracted" section — aliases/counts only, never raw PII."""
+    rel: str                    # source path (DST-relative)
+    out_rel: str                # derivative / repacked output path (DST-relative)
+    kind: str                   # "derivative" | "repack"
+    replacements: int
+    members_processed: int = 0  # archives: members scrubbed as text/nested
+    members_copied: int = 0     # archives: binary members copied in + flagged
 
 
 @dataclass
@@ -106,9 +126,11 @@ class RunStats:
     files_total: int = 0
     files_processed: int = 0
     files_copied: int = 0       # binary / undecodable / oversize passthrough
+    files_extracted: int = 0    # binary formats turned into scrubbed derivatives
     replacements: int = 0
     per_file: list[FileStat] = field(default_factory=list)
     skipped: list[FileStat] = field(default_factory=list)
+    extracted: list[ExtractRecord] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
 
@@ -320,6 +342,7 @@ def process_tree(
     stream_threshold: int = 50 * 1024 * 1024,
     progress: ProgressCallback | None = None,
     post_pass: Callable[[str, str], tuple[str, int]] | None = None,
+    extract: "ExtractConfig | None" = None,
 ) -> RunStats:
     """Walk ``src``; tokenise text files into ``dst`` (when ``write``).
 
@@ -379,6 +402,25 @@ def process_tree(
             out_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(path, out_path)
 
+    # Extraction settings (format handlers). Default = ON with default limits and
+    # nothing disabled, matching the CLI default. ``extract`` is duck-typed
+    # (.enabled/.disable/.limits) so the walker stays decoupled from config.
+    if extract is None:
+        extract_enabled = True
+        extract_disable: frozenset[str] = frozenset()
+        extract_limits = ExtractLimits()
+    else:
+        extract_enabled = extract.enabled
+        extract_disable = frozenset(extract.disable)
+        extract_limits = extract.limits
+
+    def _scrub(chunk_rel: str, text: str) -> tuple[str, int]:
+        """The closure handed to every format handler: run the run's detectors/
+        amap/allowlist over ``text`` and return (scrubbed_text, count). Handlers
+        never import the engine or touch the AliasMap directly."""
+        new_text, reps = tokenize(text, detectors, amap, allowlist_cf, file=chunk_rel)
+        return new_text, len(reps)
+
     for path, rel, size in candidates:
         stats.files_total += 1
         out_path = (dst / rel) if dst is not None else None
@@ -386,6 +428,46 @@ def process_tree(
         if size > max_bytes:
             _copy_through(rel, "oversize",
                           f"{rel}: {size} bytes > max ({max_bytes}); copied unprocessed")
+            files_done += 1
+            bytes_done_total += size
+            _emit(rel)
+            continue
+
+        # Format extraction: turn a supported binary (pcap/archive/office/
+        # sqlite) into scrubbed text/repacked output, BEFORE the plain
+        # copy-through. On ExtractError (corrupt/encrypted/guard tripped) fall
+        # back to the exact old behaviour: copy the original through + flag.
+        # The handler is responsible for deleting any partial derivative before
+        # raising, so the fallback never leaves a half-written output behind.
+        handler = get_handler(path.suffix) if extract_enabled else None
+        if handler is not None and handler.name not in extract_disable:
+            try:
+                outcome = handler.process(path, rel, out_path, _scrub,
+                                          write=write, limits=extract_limits)
+            except ExtractError as e:
+                _copy_through(
+                    rel, "binary",
+                    f"{rel}: binary type, copied unprocessed (may contain PII)"
+                    + _capture_export_hint(path.suffix)
+                    + f" — extraction skipped: {e}",
+                )
+                files_done += 1
+                bytes_done_total += size
+                _emit(rel)
+                continue
+            stats.extracted.append(ExtractRecord(
+                rel=rel, out_rel=outcome.out_rel, kind=outcome.kind,
+                replacements=outcome.replacements,
+                members_processed=outcome.members_processed,
+                members_copied=outcome.members_copied,
+            ))
+            stats.per_file.append(FileStat(
+                rel, "extracted", replacements=outcome.replacements,
+                out_rel=outcome.out_rel))
+            stats.files_extracted += 1
+            stats.replacements += outcome.replacements
+            for w in outcome.warnings:
+                stats.warnings.append(f"{rel}: {w}")
             files_done += 1
             bytes_done_total += size
             _emit(rel)

@@ -11,9 +11,30 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import profiles as _profiles
+from .formats.base import ExtractLimits
 
 DEFAULT_MAX_BYTES = 1 << 62  # effectively no hard skip; huge files are streamed
 DEFAULT_STREAM_THRESHOLD = 50 * 1024 * 1024  # 50 MB: above this, stream in chunks
+
+# [extract] defaults — mirror ExtractLimits so the config table is optional.
+DEFAULT_EXTRACT_MAX_OUT_BYTES = ExtractLimits().max_out_bytes   # 512 MB
+DEFAULT_EXTRACT_MAX_DEPTH = ExtractLimits().max_depth           # 3
+DEFAULT_EXTRACT_MAX_MEMBERS = ExtractLimits().max_members       # 50 000
+
+
+@dataclass
+class ExtractConfig:
+    """Resolved ``[extract]`` settings, plumbed as one object into the walker.
+
+    ``enabled`` is on by default (the new, strictly-safer behaviour); ``disable``
+    holds handler NAMES ("pcap"/"archive"/"office"/"sqlite") to skip (they fall
+    back to copy-through + flag). ``limits`` is the guard-rail object handlers
+    receive.
+    """
+
+    enabled: bool = True
+    disable: set[str] = field(default_factory=set)
+    limits: ExtractLimits = field(default_factory=ExtractLimits)
 
 
 @dataclass
@@ -27,6 +48,9 @@ class Config:
     exclude: list[str] = field(default_factory=list)
     max_bytes: int = DEFAULT_MAX_BYTES
     stream_threshold: int = DEFAULT_STREAM_THRESHOLD
+    # Resolved [extract] table (format extractors). CLI --no-extract /
+    # --extract-disable merge on top later.
+    extract: ExtractConfig = field(default_factory=ExtractConfig)
     # Optional [llm] table. CLI flags override these. ``enabled`` only takes
     # effect if the operator also passes --llm (the flag is the explicit
     # opt-in); the config can set provider/endpoint/model defaults.
@@ -75,6 +99,19 @@ def _merge_raw(base: dict, overlay: dict) -> dict:
         out["max_bytes"] = overlay["max_bytes"]
     if "stream_threshold" in overlay:
         out["stream_threshold"] = overlay["stream_threshold"]
+    # [extract] table: disable list unions (like detector toggles); scalar
+    # limits + enabled flag override when the overlay sets them.
+    bext = dict(base.get("extract", {}) or {})
+    oext = dict(overlay.get("extract", {}) or {})
+    merged_ext = dict(bext)
+    merged_ext["disable"] = _dedupe(
+        list(bext.get("disable", [])) + list(oext.get("disable", [])))
+    for k in ("enabled", "max_out_bytes", "max_depth", "max_members"):
+        if k in oext:
+            merged_ext[k] = oext[k]
+    if merged_ext.get("disable") or any(
+            k in merged_ext for k in ("enabled", "max_out_bytes", "max_depth", "max_members")):
+        out["extract"] = merged_ext
     # [llm] table: merge key-by-key, overlay wins (so a project toml can refine
     # a profile's llm defaults without clobbering the rest).
     bllm = dict(base.get("llm", {}) or {})
@@ -97,7 +134,20 @@ def _config_from_raw(raw: dict) -> Config:
         exclude=list(raw.get("exclude", []) or []),
         max_bytes=int(raw.get("max_bytes", DEFAULT_MAX_BYTES)),
         stream_threshold=int(raw.get("stream_threshold", DEFAULT_STREAM_THRESHOLD)),
+        extract=_extract_from_raw(raw.get("extract", {}) or {}),
         llm=dict(raw.get("llm", {}) or {}),
+    )
+
+
+def _extract_from_raw(ext: dict) -> ExtractConfig:
+    return ExtractConfig(
+        enabled=bool(ext.get("enabled", True)),
+        disable=set(ext.get("disable", []) or []),
+        limits=ExtractLimits(
+            max_out_bytes=int(ext.get("max_out_bytes", DEFAULT_EXTRACT_MAX_OUT_BYTES)),
+            max_depth=int(ext.get("max_depth", DEFAULT_EXTRACT_MAX_DEPTH)),
+            max_members=int(ext.get("max_members", DEFAULT_EXTRACT_MAX_MEMBERS)),
+        ),
     )
 
 
