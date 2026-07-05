@@ -33,6 +33,14 @@ PROFILES: dict[str, dict] = {
     "pcap-text": {
         "include": ["*.txt", "*.csv"],
     },
+
+    # LLM-prep north star: produce LLM-ready, leak-proof, RE-IDENTIFIABLE views
+    # of messy multi-source AV-network data. Structured aliases keep the network
+    # shape an LLM needs (subnet grouping, multicast, link-local) VISIBLE while
+    # every value stays reversible via the vault/decode map; jsonl emits one
+    # record per line/packet for clean ingestion. Well-knowns are kept verbatim
+    # by default (keep_wellknown), so no extra key is needed here.
+    "llm": {"alias_style": "structured", "out_format": "jsonl"},
 }
 
 

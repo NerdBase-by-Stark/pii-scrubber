@@ -392,6 +392,7 @@ def _stream_file(
     bytes_base: int,
     progress: ProgressCallback | None,
     out_format: str = "text",
+    style: Callable[[Detector, str], str] | None = None,
 ) -> int:
     """Stream a single (already-confirmed-text) huge file in overlapping chunks.
 
@@ -442,7 +443,7 @@ def _stream_file(
                     safe_end = len(buf) - OVERLAP
                     out_text, reps, consumed = tokenize_segment(
                         buf, detectors, amap, allowlist_cf, file=rel,
-                        safe_end=safe_end,
+                        safe_end=safe_end, style=style,
                     )
                     if rec_writer is not None:
                         rec_writer.feed(out_text)
@@ -475,6 +476,7 @@ def _stream_file(
                 raise _UndecodableStream(str(e)) from e
             out_text, reps, _consumed = tokenize_segment(
                 buf, detectors, amap, allowlist_cf, file=rel, safe_end=len(buf),
+                style=style,
             )
             if rec_writer is not None:
                 rec_writer.feed(out_text)
@@ -514,6 +516,7 @@ def process_tree(
     post_pass: Callable[[str, str], tuple[str, int]] | None = None,
     extract: "ExtractConfig | None" = None,
     out_format: str = "text",
+    style: Callable[[Detector, str], str] | None = None,
 ) -> RunStats:
     """Walk ``src``; tokenise text files into ``dst`` (when ``write``).
 
@@ -545,6 +548,12 @@ def process_tree(
     outputs and repacked archives are never re-shaped. See
     docs/plans/2026-07-05-llm-prep-mode-design.md decisions #4/#5. ``out_format``
     only affects strip (``write``); scan reports as today.
+
+    ``style`` (optional ``(detector, value) -> alias_prefix`` callable, e.g.
+    :func:`engine.make_structured_style`) is threaded into every tokenize call —
+    the whole-file path, the ``_scrub`` closure handed to format handlers, and
+    the streaming path — so structured aliases are applied uniformly across
+    plain files, derivatives, and huge files. None (default) = opaque prefixes.
     """
     if out_format not in OUT_FORMATS:
         raise ValueError(
@@ -637,7 +646,8 @@ def process_tree(
         """The closure handed to every format handler: run the run's detectors/
         amap/allowlist over ``text`` and return (scrubbed_text, count). Handlers
         never import the engine or touch the AliasMap directly."""
-        new_text, reps = tokenize(text, detectors, amap, allowlist_cf, file=chunk_rel)
+        new_text, reps = tokenize(text, detectors, amap, allowlist_cf,
+                                  file=chunk_rel, style=style)
         return new_text, len(reps)
 
     for path, rel, size in candidates:
@@ -845,7 +855,7 @@ def process_tree(
                     path, stream_out_path, rel, detectors, amap, allowlist_cf, enc,
                     write, files_done=files_done, files_total=files_total,
                     bytes_total=bytes_total, bytes_base=bytes_done_total,
-                    progress=progress, out_format=out_format,
+                    progress=progress, out_format=out_format, style=style,
                 )
             except _UndecodableStream:
                 # FIX 1: invalid bytes appeared in a later block. _stream_file
@@ -892,7 +902,8 @@ def process_tree(
             continue
 
         text, enc = decoded
-        new_text, reps = tokenize(text, detectors, amap, allowlist_cf, file=rel)
+        new_text, reps = tokenize(text, detectors, amap, allowlist_cf, file=rel,
+                                  style=style)
         rep_count = len(reps)
         # Optional second pass: runs on the ALREADY-STRIPPED text (``new_text``),
         # never on raw ``text``. Adds extra aliases via the shared amap.
