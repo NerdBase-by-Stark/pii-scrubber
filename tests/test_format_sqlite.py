@@ -11,6 +11,7 @@ to copy-through + flag, and cross-cutting alias sharing with plain text files.
 from __future__ import annotations
 
 import sqlite3
+import sys
 from pathlib import Path
 
 import pytest
@@ -391,7 +392,14 @@ def test_shared_alias_between_db_and_text(tmp_path: Path):
 # URI encoding: a source filename containing URI metacharacters ('?', '#', '%')
 # must open the ACTUAL file, never a percent-decoded different path.
 
-@pytest.mark.parametrize("fname", ["we?rd.db", "ta#g.db", "a%62.db"])
+@pytest.mark.parametrize("fname", [
+    # '?' is an illegal filename character on Windows, so that fixture can only
+    # exist on POSIX; '#' and '%' are legal everywhere.
+    pytest.param("we?rd.db", marks=pytest.mark.skipif(
+        sys.platform == "win32", reason="'?' is not a legal Windows filename char")),
+    "ta#g.db",
+    "a%62.db",
+])
 def test_uri_metachar_filenames_open_correct_db(tmp_path: Path, fname: str):
     # A decoy file whose name is what a naive raw-path URI would decode/truncate
     # to (e.g. 'a%62.db' -> 'ab.db', 'we?rd.db' -> 'we'); it holds DIFFERENT data
