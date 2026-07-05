@@ -301,9 +301,11 @@ that cannot be fully/safely read — corrupt, encrypted/password-protected, a
 tripped size/depth/member guard — **fails open**: the original is copied through
 unchanged and flagged "may contain PII" (the pre-extraction behaviour).
 
-Formats with **no** built-in extractor (`.evtx` / `.etl` / `.pdf`) are still
-copied through + flagged with an export-to-text hint; export them first
-(`wevtutil qe FILE /lf:true /f:text > out.txt`) then re-run on the text.
+Formats with **no** built-in extractor are still copied through + flagged with
+an export-to-text hint. For `.evtx` / `.etl`, export on a Windows host first
+(`wevtutil qe FILE /lf:true /f:text > out.txt`) then re-run on the text. For
+`.pdf`, extract the text with any PDF-to-text tool (e.g. `pdftotext`) and re-run
+on that output.
 
 ### Turning it off
 
@@ -412,8 +414,11 @@ extracted `app.log` with the same decode map.
 
 A `.txt` / `.csv` derivative is plain text + aliases, so `piiscrub reverse`
 rehydrates it directly against the decode map / vault. For a **repacked
-`.zip`/`.tar`**, unzip it first, then run `reverse` on each extracted text
-member with the same map — the members are ordinary scrubbed text.
+archive** (`.zip`, `.tar`, `.tar.gz`/`.tgz`, `.tar.bz2`, `.tar.xz`), extract it
+first (decompressing as needed), then run `reverse` on each extracted text
+member with the same map — the members are ordinary scrubbed text. A repacked
+**single-file** `.gz`/`.bz2`/`.xz` is decompressed the same way (`gunzip`,
+`bunzip2`, `unxz`) before reversing the inner text file.
 
 ---
 
