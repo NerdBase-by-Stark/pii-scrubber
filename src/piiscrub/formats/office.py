@@ -167,18 +167,35 @@ def _workbook_rels(zf: zipfile.ZipFile) -> dict[str, str]:
     return out
 
 
+# Excel's real maximum column is XFD (16384). Cell refs are clamped to it so a
+# CRAFTED ref like ``r="ZZZZZZZZ1"`` (which decodes to ~2.2e11) cannot make
+# ``_emit_sheet`` build a per-row list of that many cells: that allocation raises
+# MemoryError, which is NOT an ExtractError, so the whole strip/scan run would
+# abort with a traceback instead of falling back to copy-through+flag. The
+# malicious XML part is only a few hundred bytes, so the declared-size pre-check
+# in ``_OfficeHandler.process`` does not catch it — this clamp is the guard.
+_MAX_COL = 16384
+
+
 def _col_index(ref: str) -> int:
-    """Excel cell ref (``"AB12"``) -> 1-based column index (``28``)."""
+    """Excel cell ref (``"AB12"``) -> 1-based column index (``28``), clamped to
+    Excel's real column maximum :data:`_MAX_COL` (XFD, 16384).
+
+    The clamp is a fail-safe against a crafted cell ref with many column letters
+    (see :data:`_MAX_COL`); a real worksheet never exceeds 16384 columns."""
     letters = ""
     for ch in ref:
-        if ch.isalpha():
-            letters += ch.upper()
-        else:
+        if not ch.isalpha():
             break
+        letters += ch.upper()
+        if len(letters) >= 4:
+            # 4+ column letters already exceed XFD; stop before building a huge
+            # index (and never accumulate an unbounded-length ``letters`` string).
+            return _MAX_COL
     idx = 0
     for ch in letters:
         idx = idx * 26 + (ord(ch) - 64)
-    return idx or 1
+    return min(idx, _MAX_COL) or 1
 
 
 def _cell_value(c: ET.Element, shared: list[str]) -> str:

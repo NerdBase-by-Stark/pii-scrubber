@@ -516,8 +516,7 @@ def test_walker_office_write_enametoolong_falls_back_to_copy_flag(tmp_path: Path
     src = tmp_path / "src"
     dst = tmp_path / "dst"
     src.mkdir()
-    long_name = "d" * 249 + ".docx"          # 254 chars
-    + ".txt" = 258 > 255
+    long_name = "d" * 249 + ".docx"          # 254 chars; + ".txt" = 258 > 255
     make_docx(src / long_name, ["email jack@corp.com"])
     # A second, normal doc after it proves the run does NOT abort mid-way.
     make_docx(src / "ok.docx", ["email jill@corp.com"])

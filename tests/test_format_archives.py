@@ -411,7 +411,7 @@ def test_verify_recursion_into_nested_archive(tmp_path: Path):
     (dst / "outer.zip").write_bytes(_zip_bytes({"nested.zip": inner}))
     res = audit.verify_tree(dst, build_active())
     assert res["clean"] is False
-    assert any(l["file"] == "outer.zip!nested.zip!deep.log" for leak in res["leaks"])
+    assert any(leak["file"] == "outer.zip!nested.zip!deep.log" for leak in res["leaks"])
 
 
 def test_verify_clean_when_members_scrubbed(tmp_path: Path):
@@ -709,8 +709,7 @@ def test_single_file_gz_write_enametoolong_falls_back(tmp_path: Path):
     src = tmp_path / "src"
     dst = tmp_path / "dst"
     src.mkdir()
-    long_name = "a" * 245 + ".pcap.gz"       # 253 chars
-    deriv +'.txt' = 257 > 255
+    long_name = "a" * 245 + ".pcap.gz"       # 253 chars; deriv +'.txt' = 257 > 255
     (src / long_name).write_bytes(gzip.compress(_pcap_member_bytes()))
     (src / "ok.log.gz").write_bytes(gzip.compress(b"ip 10.0.0.9\n"))
     stats = _run(src, dst)                    # must NOT raise

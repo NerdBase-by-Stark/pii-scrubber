@@ -107,6 +107,12 @@ class _Sink:
         self._lines: list[str] = []
         self._n = 0
         self._max = max_bytes
+        # Set per packet: True when the packet was TRUNCATED at capture time
+        # (caplen < origlen, e.g. a tcpdump snaplen limit). A truncated packet's
+        # final printable run may have been cut mid-token by the capture boundary
+        # rather than by a real separator, so ``_emit_strings`` drops that final
+        # run to avoid writing a raw, un-aliased PII fragment (see below).
+        self.packet_truncated = False
 
     def add(self, line: str) -> None:
         self._n += len(line) + 1
@@ -164,9 +170,19 @@ def _emit_strings(data: bytes, sink: _Sink) -> None:
     truncated = False
     run = bytearray()
 
-    def flush() -> None:
+    def flush(final: bool = False) -> None:
         nonlocal emitted, truncated
         if len(run) < _MIN_RUN:
+            return
+        # A run that reaches the physical end of a CAPTURE-truncated packet
+        # (caplen < origlen) may be a PII value cut mid-token by the snaplen/
+        # caplen boundary, not by a real non-printable separator. E.g. an HTTP
+        # header ending 'From: bob.smith@stark-r' loses its TLD, so the email
+        # detector never matches and the raw fragment would be written into the
+        # DST derivative and slip past verify. Drop the whole FINAL run in that
+        # case. Runs closed by a genuine separator (``final`` False) are real
+        # token boundaries and always safe; only the trailing run is at risk.
+        if final and sink.packet_truncated:
             return
         if emitted >= _PAYLOAD_STR_CAP:
             truncated = True
@@ -195,7 +211,7 @@ def _emit_strings(data: bytes, sink: _Sink) -> None:
             if emitted >= _PAYLOAD_STR_CAP:
                 truncated = True
                 break
-    flush()
+    flush(final=True)
     if truncated:
         sink.add(f"# note: payload strings truncated at {_PAYLOAD_STR_CAP} chars")
 
@@ -593,12 +609,17 @@ def _parse_classic(data: bytes, endian: str, ns: bool, sink: _Sink,
         frac = ts_sub / 1e9 if ns else ts_sub / 1e6
         sink.add(f"# packet {idx} ts={_fmt_ts(ts_sec + frac)} "
                  f"caplen={incl} origlen={orig}")
+        # caplen < origlen => the packet was truncated at capture time; its final
+        # printable run may be cut mid-token, so _emit_strings must drop it.
+        sink.packet_truncated = incl < orig
         try:
             _dissect_by_linktype(linktype, pkt, sink)
         except ExtractError:
             raise
         except Exception:      # noqa: BLE001 - a bad packet is not a bad file
             sink.add("# WARNING: packet dissection error")
+        finally:
+            sink.packet_truncated = False
     if pos < n and n - pos < 16:
         warnings.append("trailing bytes after final packet")
 
@@ -707,7 +728,13 @@ def _emit_epb(data: bytes, pos: int, total_len: int, endian: str,
     idx += 1
     sink.add(f"# packet {idx} ts={_fmt_ts(_pcapng_seconds(ts64, tsresol))} "
              f"caplen={caplen} origlen={origlen}")
-    _dissect_by_linktype(linktype, pkt, sink)
+    # Truncated at capture (caplen < origlen): drop the final printable run so a
+    # value cut at the capture boundary is never written raw (see _emit_strings).
+    sink.packet_truncated = caplen < origlen
+    try:
+        _dissect_by_linktype(linktype, pkt, sink)
+    finally:
+        sink.packet_truncated = False
     return idx
 
 
@@ -721,7 +748,13 @@ def _emit_spb(data: bytes, pos: int, total_len: int, endian: str,
     linktype = interfaces[0][0] if interfaces else _LT_ETHERNET
     idx += 1
     sink.add(f"# packet {idx} ts=n/a caplen={caplen} origlen={origlen}")
-    _dissect_by_linktype(linktype, pkt, sink)
+    # SPB carries no stored caplen; if the block held fewer bytes than origlen the
+    # packet was truncated at capture, so drop the final run (see _emit_strings).
+    sink.packet_truncated = caplen < origlen
+    try:
+        _dissect_by_linktype(linktype, pkt, sink)
+    finally:
+        sink.packet_truncated = False
     return idx
 
 

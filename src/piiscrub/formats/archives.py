@@ -133,6 +133,41 @@ def _bad_name(name: str) -> bool:
     return ".." in PurePosixPath(norm).parts
 
 
+def _bad_link(linkname: str, member_name: str) -> bool:
+    """True if a symlink/hardlink target is absolute or escapes the archive root.
+
+    A tar member name can pass :func:`_bad_name` (neither absolute nor containing
+    ``..``) while its *link target* still points outside the tree — e.g. a symlink
+    ``logs`` -> ``/etc`` or ``../../..``. Faithfully repacking such a link re-arms
+    the very path-traversal the name guard exists to block: a follow-links
+    extractor would then write through the link outside the target tree. We
+    resolve the target relative to the directory the link lives in (symlink
+    semantics; a stricter-but-safe rule for root-relative hardlink targets too)
+    and reject anything absolute or escaping the root. Such members are skipped +
+    flagged rather than written into the repack.
+    """
+    if not linkname:
+        return True
+    norm = linkname.replace("\\", "/")
+    if norm.startswith("/"):                       # POSIX-absolute / UNC
+        return True
+    if (len(norm) >= 2 and norm[0].isalpha() and norm[1] == ":"
+            and (len(norm) == 2 or norm[2] == "/")):   # Windows drive-absolute
+        return True
+    base = PurePosixPath(member_name.replace("\\", "/")).parent
+    depth = 0
+    for part in (base / norm).parts:
+        if part == "..":
+            depth -= 1
+            if depth < 0:                           # climbed above the root
+                return True
+        elif part in ("", "."):
+            continue
+        else:
+            depth += 1
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Single-stream (de)compression helpers.
 
@@ -253,9 +288,12 @@ def _handle_member(
     handler's derivative can be much LARGER than the raw member — a pcap
     dissection expands ~4x); the caller debits it from the archive's running
     ``max_out_bytes`` budget so total expanded text stays bounded (see the call
-    sites). In scan mode the nested-handler output size is not materialised, so
-    ``out_size`` is 0 for that path (nothing is written; only the in-memory
-    per-member budget the handler already enforces applies).
+    sites). The nested-handler output is materialised (into a private temp dir
+    that is discarded) EVEN in scan mode purely to measure ``out_size``, so the
+    expansion debit — and thus the ``max_out_bytes`` budget trip — fires
+    identically in scan and strip. Without this, scan would report a member as
+    scrubbable that strip actually copies+flags once the expansion overshoots the
+    budget (findings 5/8/10: scan must reflect what strip does).
 
     ``remaining_budget`` is what is left of the source file's ``max_out_bytes``
     after this archive's members read so far; a nested handler is capped to it so
@@ -281,8 +319,13 @@ def _handle_member(
             disable=limits.disable,
         )
         try:
+            # Always materialise (write=True) so we learn the produced size and
+            # can debit the expansion budget the same way in scan and strip; the
+            # bytes land only in _run_nested's private temp dir and are discarded.
+            # Nothing reaches DST in scan mode — the caller writes ``out_data``
+            # only when ``zout``/``tout`` exist (i.e. top-level write).
             out_name, out_data, _kind, reps = _run_nested(
-                handler, name, data, member_rel, scrub, nested_limits, write)
+                handler, name, data, member_rel, scrub, nested_limits, write=True)
         except ExtractError as e:
             # Fail-open per member: copy the binary in unchanged and flag it.
             return (name, data if write else None, False, True, 0,
@@ -290,7 +333,7 @@ def _handle_member(
                      f"copied unchanged (may contain PII)"],
                     len(data))
         out_size = len(out_data) if out_data is not None else 0
-        return out_name, out_data, True, False, reps, [], out_size
+        return out_name, (out_data if write else None), True, False, reps, [], out_size
 
     if suffix in BINARY_EXTS or get_handler(suffix) is not None:
         # ``get_handler(...) is not None`` catches a DISABLED handler's suffix
@@ -448,8 +491,17 @@ def _process_tar(path: Path, rel: str, out_path: Path | None, scrub: ScrubFn,
                 warnings.append(f"member {name!r}: unsafe path, skipped (not written)")
                 continue
             if not m.isfile():
-                # Directory / symlink / device / fifo: no file content to scrub;
-                # carry the structural entry through unchanged.
+                # Directory / symlink / hardlink / device / fifo: no file content
+                # to scrub; carry the structural entry through unchanged — EXCEPT
+                # a symlink/hardlink whose target is absolute or escapes the root,
+                # which would re-arm the path-traversal the name guard blocks (a
+                # follow-links extractor writes through it outside the tree). Skip
+                # + flag those instead of faithfully repacking them.
+                if (m.issym() or m.islnk()) and _bad_link(m.linkname, m.name):
+                    warnings.append(
+                        f"member {name!r}: unsafe link target "
+                        f"{m.linkname!r}, skipped (not written)")
+                    continue
                 if tout is not None:
                     tout.addfile(m)
                 continue
@@ -725,8 +777,16 @@ def _iter_text_zip(data: bytes, rel: str, limits: ExtractLimits,
                 # fail-closed.
                 continue
             name = info.filename
-            if _bad_name(name) or name.endswith("/"):
+            if name.endswith("/"):
                 continue
+            # NB: bad-named members (absolute / ``..``) are NOT skipped here. The
+            # _bad_name guard belongs only on the WRITE/repack path (a repacked
+            # traversal entry re-arms the exploit on extraction); verify only READS
+            # member bytes, so skipping a bad-named member is pure fail-OPEN — a
+            # readable text member stored under '/abs/leak.txt' or '../escape.txt'
+            # holding raw PII would slip past as clean (the copy+flag fallback
+            # places the ORIGINAL archive, bad names and all, into DST). Scan every
+            # readable member regardless of its stored name.
             seen += 1
             if seen > limits.max_members or running + info.file_size > limits.max_out_bytes:
                 yield f"{rel}!<scan truncated at cap>", SCAN_TRUNCATED
@@ -745,8 +805,12 @@ def _iter_text_tar(data: bytes, rel: str, limits: ExtractLimits,
         running = 0
         seen = 0
         for m in t.getmembers():
-            if not m.isfile() or _bad_name(m.name):
+            if not m.isfile():
                 continue
+            # As in _iter_text_zip: do NOT skip bad-named members on the verify
+            # (read-only) path. _bad_name is a WRITE-path guard; skipping here is
+            # fail-open and would let a readable text member stored under an
+            # absolute / '..' name leak raw PII past verify as clean.
             seen += 1
             if seen > limits.max_members or running + m.size > limits.max_out_bytes:
                 yield f"{rel}!<scan truncated at cap>", SCAN_TRUNCATED
