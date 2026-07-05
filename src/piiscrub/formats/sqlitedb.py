@@ -126,7 +126,12 @@ class _SqliteHandler:
         # never block on another process's lock. Any sqlite failure (corrupt,
         # not-a-database, locked) is a sqlite3.Error -> ExtractError -> the walker
         # copies the original through and flags it.
-        uri = f"file:{path}?mode=ro&immutable=1"
+        # Percent-encode the path before embedding it in the URI: sqlite
+        # percent-decodes the filename and truncates at an unescaped '?' or '#',
+        # so a legally named source like ``we?rd.db`` or ``a%62.db`` would
+        # otherwise fail to open or, worse, resolve to a DIFFERENT file
+        # (``a%62.db`` decodes to ``ab.db``). ``safe="/"`` keeps path separators.
+        uri = f"file:{quote(str(path), safe='/')}?mode=ro&immutable=1"
         try:
             with closing(sqlite3.connect(uri, uri=True)) as conn:
                 dump = _dump(conn, limits)

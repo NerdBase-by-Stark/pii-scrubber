@@ -20,6 +20,7 @@ from .audit import reverse_file, verify_tree
 from .config import Config, resolve_config
 from .detectors import build_active
 from .engine import AliasMap
+from .formats import handler_names
 from . import entities as entities_mod
 from . import llm as llm_mod
 from . import manifest as manifest_mod
@@ -62,6 +63,15 @@ def _merge_cli_into_config(cfg: Config, args: argparse.Namespace) -> Config:
         cfg.extract.enabled = False
     if getattr(args, "extract_disable", None):
         cfg.extract.disable |= set(args.extract_disable)
+    # Fail fast on an unknown extractor name (a typo like "pacp" or the wrong
+    # handler name "sqlite3"): silently ignoring it would leave extraction ON and
+    # drop the source binaries the operator meant to preserve.
+    valid = handler_names()
+    unknown = sorted(set(cfg.extract.disable) - valid)
+    if unknown:
+        raise SystemExit(
+            "error: unknown extractor name(s) in --extract-disable/[extract].disable: "
+            f"{', '.join(unknown)}; valid names: {', '.join(sorted(valid))}")
     return cfg
 
 
