@@ -19,6 +19,7 @@ import codecs
 import fnmatch
 import os
 import shutil
+import tempfile
 import warnings
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -422,12 +423,15 @@ def process_tree(
     # Output-namespace bookkeeping so a format derivative (``x.pcap`` ->
     # ``x.pcap.txt``) can never silently clobber, or be clobbered by, a real
     # sibling source file that already lives at that exact name (e.g. a plain
-    # ``x.pcap.txt`` created by the old export-to-text hint). Because a
-    # derivative name strictly EXTENDS its producer's rel, the producer always
-    # sorts before the colliding plain file; we relocate the derivative to a
-    # unique name (and warn) rather than lose either file or misattribute the
-    # manifest. ``reserved_rels`` is every source rel (any of which may be
-    # written at its own path); ``claimed_out_rels`` accrues derivative outputs.
+    # ``x.pcap.txt`` created by the old export-to-text hint). ``reserved_rels`` is
+    # every source rel (any of which may be written at its own path);
+    # ``claimed_out_rels`` accrues derivative outputs. We resolve the derivative's
+    # unique name here and MOVE the handler's staged output onto it (see the
+    # extraction block); the handler never writes into DST directly, so ordering
+    # between a producer and its colliding sibling no longer matters — critically,
+    # on a case-INSENSITIVE filesystem (macOS/APFS, Windows/NTFS) where writing
+    # ``x.pcap.txt`` would truncate an already-written ``X.PCAP.TXT`` sibling, the
+    # move targets only the collision-resolved name and never the sibling.
     reserved_rels = {rel for _p, rel, _s in candidates}
     claimed_out_rels: set[str] = set()
 
@@ -476,39 +480,84 @@ def process_tree(
         # raising, so the fallback never leaves a half-written output behind.
         handler = get_handler(path.suffix) if extract_enabled else None
         if handler is not None and handler.name not in extract_disable:
+            # STAGE the handler's output in a private temp dir under DST rather
+            # than letting it write ``dst/rel`` (+suffix) directly. A derivative's
+            # collision-resolved name is only known AFTER the handler reports its
+            # ``out_rel``; if the handler wrote the natural name first, then on a
+            # case-INSENSITIVE filesystem it would already have truncated a
+            # case-differing sibling (e.g. a plain ``X.PCAP.TXT``) that sorted
+            # first — the post-write relocation cannot undo that. Staging lets us
+            # place the single produced file onto the resolved-unique path ourselves
+            # (an atomic same-filesystem rename), never touching the sibling.
+            stage_dir: Path | None = None
+            if write and dst is not None:
+                dst.mkdir(parents=True, exist_ok=True)
+                stage_dir = Path(tempfile.mkdtemp(
+                    dir=str(dst), prefix=".piiscrub-stage-"))
+            stage_out_path = (stage_dir / Path(rel).name) if stage_dir else None
+            placement_error: OSError | None = None
             try:
-                outcome = handler.process(path, rel, out_path, _scrub,
-                                          write=write, limits=handler_limits)
-            except ExtractError as e:
+                try:
+                    outcome = handler.process(path, rel, stage_out_path, _scrub,
+                                              write=write, limits=handler_limits)
+                except ExtractError as e:
+                    _copy_through(
+                        rel, "binary",
+                        f"{rel}: binary type, copied unprocessed (may contain PII)"
+                        + _capture_export_hint(path.suffix)
+                        + f" — extraction skipped: {e}",
+                    )
+                    files_done += 1
+                    bytes_done_total += size
+                    _emit(rel)
+                    continue
+
+                # Resolve the final output name. A derivative whose name collides
+                # (case-insensitively) with a real source file or an earlier
+                # derivative is uniquified so neither file is lost and the manifest
+                # attributes each output to the right source. A repack keeps its
+                # own rel (equal to a source path, so it cannot collide).
+                out_rel = outcome.out_rel
+                if outcome.kind == "derivative":
+                    out_rel = _unique_out_rel(outcome.out_rel)
+                    if out_rel != outcome.out_rel:
+                        stats.warnings.append(
+                            f"{rel}: derivative {outcome.out_rel!r} collides with "
+                            f"an existing file; written as {out_rel!r} instead")
+
+                # Move the handler's single staged output onto the resolved path.
+                if stage_dir is not None and dst is not None:
+                    produced = sorted(
+                        p for p in stage_dir.rglob("*") if p.is_file())
+                    if produced:
+                        final = dst / out_rel
+                        try:
+                            final.parent.mkdir(parents=True, exist_ok=True)
+                            os.replace(produced[0], final)
+                        except OSError as e:
+                            # e.g. ENAMETOOLONG on the resolved output name: fail
+                            # OPEN to copy-through + flag (the staged file is
+                            # discarded with the stage dir in ``finally``).
+                            placement_error = e
+                if placement_error is None and outcome.kind == "derivative":
+                    claimed_out_rels.add(out_rel)
+            finally:
+                if stage_dir is not None:
+                    shutil.rmtree(stage_dir, ignore_errors=True)
+
+            if placement_error is not None:
                 _copy_through(
                     rel, "binary",
                     f"{rel}: binary type, copied unprocessed (may contain PII)"
                     + _capture_export_hint(path.suffix)
-                    + f" — extraction skipped: {e}",
+                    + f" — extraction skipped: could not place output: "
+                    f"{placement_error}",
                 )
                 files_done += 1
                 bytes_done_total += size
                 _emit(rel)
                 continue
-            # Guard the output namespace: a derivative whose name collides with a
-            # real source file (a repack keeps its own rel, which cannot collide)
-            # is relocated to a unique name so neither file is lost and the
-            # manifest attributes each output to the right source.
-            out_rel = outcome.out_rel
-            if outcome.kind == "derivative":
-                unique = _unique_out_rel(out_rel)
-                if unique != out_rel:
-                    stats.warnings.append(
-                        f"{rel}: derivative {out_rel!r} collides with an existing "
-                        f"file; written as {unique!r} instead")
-                    if write and dst is not None:
-                        produced = dst / out_rel
-                        if produced.exists():
-                            relocated = dst / unique
-                            relocated.parent.mkdir(parents=True, exist_ok=True)
-                            os.replace(produced, relocated)
-                    out_rel = unique
-                claimed_out_rels.add(out_rel)
+
             stats.extracted.append(ExtractRecord(
                 rel=rel, out_rel=out_rel, kind=outcome.kind,
                 replacements=outcome.replacements,
