@@ -266,7 +266,12 @@ class _StructuredHandler:
         if write and out_path is not None:
             try:
                 out_path.parent.mkdir(parents=True, exist_ok=True)
-                out_path.write_text(out_text, encoding="utf-8")
+                # newline="" so csv's own \r\n line terminator (and jsonl/json's
+                # explicit \n) is written verbatim — the default text-mode write
+                # translates \n to os.linesep on Windows, doubling csv rows to
+                # \r\r\n (blank line between every row). Same convention as
+                # pcap.py's derivative write and the walker's _RecordWriter.
+                out_path.write_text(out_text, encoding="utf-8", newline="")
             except OSError as e:
                 # A failure mid-write must not leave a truncated output behind
                 # (fail-open invariant) and must not abort the whole run:
