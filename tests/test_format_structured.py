@@ -23,6 +23,7 @@ from piiscrub.config import ExtractConfig
 from piiscrub.detectors import build_active
 from piiscrub.engine import AliasMap
 from piiscrub.formats import ExtractLimits, get_handler
+from piiscrub.formats.structured import _csv_dialect
 from piiscrub.walker import process_tree
 
 
@@ -102,16 +103,16 @@ def test_csv_header_row_scrubbed_like_any_row(tmp_path: Path):
 
 
 # ----------------------------------------------------------------------
-# json: values aliased (nested dict/list), keys and non-strings untouched.
+# json: values AND PII-shaped keys aliased (nested dict/list); bool/null kept.
 
-def test_json_values_aliased_keys_and_scalars_untouched(tmp_path: Path):
+def test_json_values_and_pii_keys_aliased_bool_null_untouched(tmp_path: Path):
     src = tmp_path / "src"
     dst = tmp_path / "dst"
     src.mkdir()
     doc = {
         "device": {"name": "core-sw", "mgmt": "10.20.30.40"},
         "contacts": ["alice@example.com", {"email": "bob@example.com"}],
-        "routes": {"10.99.0.1": "gateway"},   # PII-shaped KEY stays untouched
+        "routes": {"10.99.0.1": "gateway"},   # PII-shaped KEY now aliased too
         "port": 443,
         "active": True,
         "note": None,
@@ -133,9 +134,13 @@ def test_json_values_aliased_keys_and_scalars_untouched(tmp_path: Path):
     assert parsed["contacts"][0].startswith("<EMAIL_")
     assert parsed["contacts"][1]["email"].startswith("<EMAIL_")
     assert parsed["contacts"][0] != parsed["contacts"][1]["email"]
-    # dict KEY untouched even when PII-shaped; its (clean) value untouched too.
-    assert parsed["routes"] == {"10.99.0.1": "gateway"}
-    # non-string scalars pass through as-is
+    # A PII-shaped dict KEY is now aliased too (pre-v4 the whole-text path
+    # aliased PII wherever it sat; leaving a key raw was a leak). The clean
+    # value survives and the raw IP is gone from the whole document.
+    routes = parsed["routes"]
+    assert list(routes.values()) == ["gateway"]
+    assert list(routes)[0].startswith("<IP_") and "10.99.0.1" not in body
+    # non-PII scalars pass through as-is (443 renders to text with no PII match)
     assert parsed["port"] == 443 and parsed["active"] is True
     assert parsed["note"] is None
 
@@ -296,3 +301,171 @@ def test_max_out_bytes_trip_falls_back_to_text_path(tmp_path: Path):
     assert "alice@example.com" not in body and "<EMAIL_1>" in body
     assert any("big.csv" in w and "structured parse failed" in w
                and "max_out_bytes" in w for w in stats.warnings)
+
+
+# ----------------------------------------------------------------------
+# json: PII in dict KEYS is aliased and the output stays valid JSON
+# (regression — pre-v4 whole-text tokenize aliased keys; the field-aware
+# handler used to ship IP-/email-keyed objects untouched).
+
+def test_json_ip_and_email_keys_aliased_output_still_valid(tmp_path: Path):
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    doc = {
+        "192.0.2.50": "gateway",             # IP as KEY (RFC-5737 TEST-NET-1)
+        "user@corp.example.com": "admin",    # email as KEY (RFC-2606 domain)
+    }
+    (src / "keys.json").write_text(json.dumps(doc), encoding="utf-8")
+    stats = _run(src, dst)
+
+    assert stats.files_extracted == 1
+    body = (dst / "keys.json").read_text(encoding="utf-8")
+    assert "192.0.2.50" not in body and "user@corp.example.com" not in body
+
+    parsed = json.loads(body)                # output is still valid JSON
+    keys = sorted(parsed)                     # both keys are now aliases
+    assert len(keys) == 2
+    assert any(k.startswith("<IP_") for k in keys)
+    assert any(k.startswith("<EMAIL_") for k in keys)
+    # values ride along with their (now-aliased) keys, unchanged
+    assert set(parsed.values()) == {"gateway", "admin"}
+
+
+# ----------------------------------------------------------------------
+# json: a Luhn-valid card number typed as a JSON NUMBER must not survive its
+# type — it is aliased and lands in the output as a STRING (type change is
+# intentional; pre-v4 the whole-text path aliased the digits in place).
+
+def test_json_numeric_credit_card_value_aliased_as_string(tmp_path: Path):
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    doc = {"cc": 4111111111111111, "port": 443, "flag": True, "empty": None}
+    (src / "pay.json").write_text(json.dumps(doc), encoding="utf-8")
+    stats = _run(src, dst)
+
+    assert stats.files_extracted == 1
+    body = (dst / "pay.json").read_text(encoding="utf-8")
+    assert "4111111111111111" not in body
+
+    parsed = json.loads(body)
+    assert isinstance(parsed["cc"], str) and parsed["cc"].startswith("<CC_")
+    # clean number / bool / null untouched (bool is filtered before the numeric
+    # branch, so True does not get rendered-and-scrubbed)
+    assert parsed["port"] == 443 and parsed["port"] != "443"
+    assert parsed["flag"] is True and parsed["empty"] is None
+
+
+# ----------------------------------------------------------------------
+# jsonl: PII in dict KEYS is aliased per line, every line stays valid JSON.
+
+def test_jsonl_pii_keys_aliased_per_line(tmp_path: Path):
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    (src / "keyed.jsonl").write_text(
+        '{"198.51.100.7": "seen"}\n'
+        '{"ops@corp.example.com": "owner"}\n',
+        encoding="utf-8",
+    )
+    stats = _run(src, dst)
+
+    assert stats.files_extracted == 1
+    body = (dst / "keyed.jsonl").read_text(encoding="utf-8")
+    assert "198.51.100.7" not in body and "ops@corp.example.com" not in body
+    lines = body.split("\n")
+    rec0 = json.loads(lines[0])
+    rec1 = json.loads(lines[1])
+    assert list(rec0)[0].startswith("<IP_") and list(rec0.values()) == ["seen"]
+    assert list(rec1)[0].startswith("<EMAIL_") and list(rec1.values()) == ["owner"]
+
+
+# ----------------------------------------------------------------------
+# csv: a degenerate single-column file must NOT let the Sniffer split a
+# delimiter out of the PII. Constrained sniffing fails -> excel fallback ->
+# one cell per row -> each value scrubbed whole.
+
+def test_csv_single_column_ips_scrubbed_one_column(tmp_path: Path):
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    (src / "ips.csv").write_text(
+        "10.11.12.13\n10.11.12.14\n10.11.12.15\n", encoding="utf-8")
+    stats = _run(src, dst)
+
+    assert stats.files_extracted == 1
+    body = (dst / "ips.csv").read_text(encoding="utf-8")
+    assert "10.11.12.13" not in body and "10.11.12.15" not in body
+    rows = list(csv.reader(io.StringIO(body, newline="")))
+    assert len(rows) == 3 and all(len(r) == 1 for r in rows)   # one column kept
+    assert all(r[0].startswith("<IP_") for r in rows)
+
+
+def test_csv_single_column_macs_scrubbed_one_column(tmp_path: Path):
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    (src / "macs.csv").write_text(
+        "aa:bb:cc:dd:ee:01\naa:bb:cc:dd:ee:02\n", encoding="utf-8")
+    stats = _run(src, dst)
+
+    assert stats.files_extracted == 1
+    body = (dst / "macs.csv").read_text(encoding="utf-8")
+    assert "aa:bb:cc:dd:ee:01" not in body and "aa:bb:cc:dd:ee:02" not in body
+    rows = list(csv.reader(io.StringIO(body, newline="")))
+    assert len(rows) == 2 and all(len(r) == 1 for r in rows)   # colon NOT a delim
+    assert all(r[0].startswith("<MAC_") for r in rows)
+
+
+# ----------------------------------------------------------------------
+# Regression guard for the constrained delimiter set: a legitimate multi-column
+# semicolon CSV is still sniffed as ';' and round-trips (not swallowed by the
+# fallback) — proof the delimiter restriction did not break real dialects.
+
+def test_csv_semicolon_delimiter_still_sniffed_and_round_trips(tmp_path: Path):
+    sample = (
+        "host;owner;ip\n"
+        "core1;alice@example.com;10.20.30.40\n"
+        "edge2;bob@example.com;10.20.30.41\n"
+    )
+    assert _csv_dialect(sample).delimiter == ";"   # ';' is in the allowed set
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    (src / "inv.csv").write_text(sample, encoding="utf-8")
+    stats = _run(src, dst)
+
+    assert stats.files_extracted == 1
+    body = (dst / "inv.csv").read_text(encoding="utf-8")
+    assert "alice@example.com" not in body and "10.20.30.40" not in body
+    rows = list(csv.reader(io.StringIO(body, newline=""), delimiter=";"))
+    assert len(rows) == 3 and all(len(r) == 3 for r in rows)   # 3 columns intact
+    assert rows[0] == ["host", "owner", "ip"]
+    assert rows[1][0] == "core1" and rows[1][1].startswith("<EMAIL_")
+    assert rows[1][2].startswith("<IP_")
+
+
+# ----------------------------------------------------------------------
+# json: documented edge — two DISTINCT source keys that scrub to the SAME
+# string collapse to ONE key, deterministic LAST-WINS (the later value stays).
+# Here the first key is raw PII and the second is already that PII's alias
+# text, so both resolve to <IP_1>.
+
+def test_json_post_scrub_duplicate_key_last_wins(tmp_path: Path):
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    # "10.0.0.9" -> "<IP_1>"; the literal "<IP_1>" is not PII, so it stays
+    # "<IP_1>" -> both keys collide. json source keeps insertion order, so the
+    # second ("last") value wins.
+    (src / "dup.json").write_text(
+        '{"10.0.0.9": "first", "<IP_1>": "second"}', encoding="utf-8")
+    stats = _run(src, dst)
+
+    assert stats.files_extracted == 1
+    body = (dst / "dup.json").read_text(encoding="utf-8")
+    assert "10.0.0.9" not in body
+    parsed = json.loads(body)                    # still valid JSON
+    assert parsed == {"<IP_1>": "second"}        # one key, last-wins value

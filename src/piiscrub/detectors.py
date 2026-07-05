@@ -70,13 +70,30 @@ def _ipv4_accept(m: re.Match, text: str) -> bool:
     tail = text[line_start:m.start()][-24:]
     if _VER_KEYWORD_TAIL.search(tail):
         return False
-    if m.start() > 0 and text[m.start() - 1] in "vV":
-        return False
+    i = m.start()
+    if i > 0 and text[i - 1] in "vV":
+        # Version marker only at a token boundary: "v1.2.3.4" is a version,
+        # but "dev10.0.0.1" / "srv10.0.0.2" are hostname-prefixed IPs — keep
+        # those (drop only when the v is NOT preceded by another alnum).
+        if i < 2 or not text[i - 2].isalnum():
+            return False
     return True
 
 
 def _ipv6_full_accept(m: re.Match, _text: str) -> bool:
-    # Require a hex letter so pure-decimal time-shaped groups don't match.
+    # Drop pure-decimal ALL-short-group sequences (colon-separated byte/time
+    # fields like 1:22:3:44:…) — but keep realistic decimal-only IPv6: accept
+    # when a hex letter is present OR any group has 3+ digits (zone stripped
+    # first so "%eth0" letters can't vouch for a decimal address).
+    value = m.group(0).split("%", 1)[0]
+    if re.search(r"[a-fA-F]", value):
+        return True
+    return any(len(g) >= 3 for g in value.split(":"))
+
+
+def _mac_cisco_accept(m: re.Match, _text: str) -> bool:
+    # Require a hex letter so dotted numeric triplets ("1234.5678.9012"
+    # serial/part numbers) stay untouched.
     return bool(re.search(r"[a-fA-F]", m.group(0)))
 
 
@@ -150,6 +167,11 @@ def _is_wellknown_ipv6(value: str) -> bool:
 
 def _is_wellknown_mac(value: str) -> bool:
     mac = value.casefold().replace("-", ":")
+    if mac.startswith("33:33:ff:"):
+        # Solicited-node multicast (33:33:ff:xx:xx:xx) embeds the low 3 bytes
+        # of a host's IPv6 interface-id — identifying, so NOT well-known even
+        # though it sits inside the 33:33:* IPv6-multicast prefix.
+        return False
     return mac == _WK_MAC_BROADCAST or mac.startswith(_WK_MAC_PREFIXES)
 
 
@@ -184,7 +206,10 @@ _TLDS = (
     r"invalid|uk|de|ch|fr|nl|us|jp|cn|in|ru|ca|au|eu|es|it|se|no|fi|pl|br|za"
 )
 
-_OCTET = r"(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)"
+# One dotted-quad octet. ``0\d{1,2}`` admits inet_aton-style leading zeros
+# ("010", "001" — max 3 chars, value necessarily ≤ 99 so range logic holds);
+# the ipv6 compressed detector's v4-mapped tail shares this and inherits it.
+_OCTET = r"(?:25[0-5]|2[0-4]\d|1\d\d|0\d{1,2}|[1-9]?\d)"
 
 # Trailing guard for a dotted quad (ipv4 detector and the IPv6 dotted tail).
 # A dotted quad must not continue with ".digit" or a bare digit (version-style
@@ -252,6 +277,19 @@ BUILTIN_DETECTORS: list[Detector] = [
             r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b"
         ),
         priority=65, on_by_default=True,
+    ),
+    Detector(
+        # Cisco dotted MAC notation (aabb.ccdd.eeff). Same category as the
+        # colon/dash detector below (two detectors, one category — like ipv6).
+        # Known limitation: alias keys are raw-value based, so the same
+        # physical MAC in colon and Cisco notation gets two different aliases
+        # — acceptable, each notation is internally consistent. Listed BEFORE
+        # the colon form so classify_identifier's last-wins category map keeps
+        # the colon detector as the "mac" representative.
+        "mac", "MAC",
+        re.compile(r"(?<![\w.])(?:[0-9A-Fa-f]{4}\.){2}[0-9A-Fa-f]{4}(?![\w.])"),
+        priority=60, on_by_default=True, casefold_key=True,
+        accept=_mac_cisco_accept,
     ),
     Detector(
         "mac", "MAC",

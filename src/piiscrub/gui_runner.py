@@ -27,7 +27,7 @@ from .cli import (
 )
 from .config import resolve_config
 from .detectors import build_active
-from .engine import AliasMap
+from .engine import AliasMap, make_structured_style
 from .progress import ProgressCallback
 from .projectmap import Vault
 from .report import build_summary, write_html, write_json
@@ -114,9 +114,13 @@ def run_scan(opts: RunOptions, progress: ProgressCallback | None = None) -> dict
             enable=cfg.enable,
             custom=cfg.custom,
             denylist=cfg.denylist,
+            keep_wellknown=cfg.keep_wellknown,
         )
         + entity_dets
     )
+    # Structured aliases (if requested) so the scan PREVIEW mirrors what strip
+    # would mint; out-format is not applied to scan (write=False → reports only).
+    style = make_structured_style(amap) if cfg.alias_style == "structured" else None
 
     stats = process_tree(
         src,
@@ -132,6 +136,8 @@ def run_scan(opts: RunOptions, progress: ProgressCallback | None = None) -> dict
         stream_threshold=cfg.stream_threshold,
         progress=progress,
         post_pass=None,
+        extract=cfg.extract,
+        style=style,
     )
 
     pii_dir = src / PII_DIRNAME
@@ -207,15 +213,22 @@ def run_strip(opts: RunOptions, progress: ProgressCallback | None = None) -> dic
             entities_path = Path(opts.entities) if opts.entities else None
 
         entity_dets = _load_entities(amap, entities_path)
+        # keep_wellknown is resolved ONCE here and reused for the auto-verify
+        # below (same ``detectors`` object): strip and its verify MUST agree on
+        # the well-known exemption, else kept well-knowns in the output would be
+        # flagged as leaks (false FAIL) — the critical consistency wiring.
         detectors = (
             build_active(
                 disable=cfg.disable,
                 enable=cfg.enable,
                 custom=cfg.custom,
                 denylist=cfg.denylist,
+                keep_wellknown=cfg.keep_wellknown,
             )
             + entity_dets
         )
+        # Structured aliases (design #2) when requested; else opaque prefixes.
+        style = make_structured_style(amap) if cfg.alias_style == "structured" else None
 
         stats = process_tree(
             src,
@@ -231,12 +244,15 @@ def run_strip(opts: RunOptions, progress: ProgressCallback | None = None) -> dic
             stream_threshold=cfg.stream_threshold,
             progress=progress,
             post_pass=None,
+            extract=cfg.extract,
+            out_format=cfg.out_format,
+            style=style,
         )
 
         manifest = manifest_mod.build_manifest(
             src, dst, stats, timestamp=ts, version=__version__
         )
-        audit = verify_tree(dst, detectors, cfg.allowlist_cf)
+        audit = verify_tree(dst, detectors, cfg.allowlist_cf, extract=cfg.extract)
         verify_status = "PASS" if audit["clean"] else "FAIL"
         summary = build_summary(
             mode="strip",

@@ -185,3 +185,35 @@ def test_predicates_reject_unparseable():
 def test_mac_predicate_casefold_and_hyphens():
     assert _is_wellknown_mac("FF-FF-FF-FF-FF-FF")
     assert _is_wellknown_mac("01-00-5E-00-00-FB")
+
+
+# ----------------------------------------------------------------------
+# Solicited-node multicast MACs (33:33:ff:xx:xx:xx) embed the low 3 bytes of
+# a host's IPv6 interface-id — aliased; other 33:33:* multicast stays kept.
+# ----------------------------------------------------------------------
+
+def test_solicited_node_mac_aliased():
+    out, reps = scrub("mac 33:33:ff:aa:bb:cc x")
+    assert out == "mac <MAC_1> x"
+    assert [r.category for r in reps] == ["mac"]
+
+
+def test_other_ipv6_multicast_mac_still_kept():
+    out, reps = scrub("mac 33:33:00:00:00:01 x")
+    assert out == "mac 33:33:00:00:00:01 x"
+    assert reps == []
+
+
+def test_solicited_node_predicate_separator_and_case():
+    assert not _is_wellknown_mac("33:33:ff:aa:bb:cc")
+    assert not _is_wellknown_mac("33-33-FF-AA-BB-CC")
+    assert _is_wellknown_mac("33:33:00:00:00:01")
+    assert _is_wellknown_mac("33-33-00-00-00-01")
+
+
+def test_v4mapped_leading_zero_tail_aliased():
+    # Shared _OCTET: the leading-zero octet extension propagates into the
+    # compressed-IPv6 v4-mapped tail automatically.
+    out, reps = scrub("v4map ::ffff:010.010.010.010 x")
+    assert out == "v4map <IPV6_1> x"
+    assert {r.category for r in reps} == {"ipv6"}

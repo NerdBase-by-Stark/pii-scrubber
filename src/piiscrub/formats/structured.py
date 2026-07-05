@@ -4,16 +4,22 @@ Structured sources are parsed, every recovered string is pushed through the
 walker's ``scrub`` closure, and the result is re-serialised IN THE SAME format
 under the SAME name (design doc, decision #7): a scrubbed ``.csv`` is still a
 valid CSV, a ``.json`` stays ``json.loads``-able, and a ``.jsonl`` keeps one
-JSON document per non-blank line. Only string VALUES are scrubbed — dict keys
-and non-string scalars (numbers, booleans, null) pass through untouched — so
-downstream tooling keeps its field structure while the PII inside the fields
-is aliased.
+JSON document per non-blank line. Every string is scrubbed — VALUES and dict
+KEYS alike (a JSON key is just a string, and PII keys an object as readily as it
+fills a value); numbers are scrubbed via their rendered text and become the
+ALIAS STRING when they carried PII (a Luhn-valid card typed as an int must not
+survive merely because of its JSON type), while booleans and null pass through
+untouched — so downstream tooling keeps its field structure while the PII inside
+the fields (and the keys) is aliased.
 
-* csv: dialect sniffed from a bounded sample (:class:`csv.Sniffer`, fallback
-  ``excel``); every cell — the header row included, hostnames live there — is
-  scrubbed individually and rewritten with the same dialect (same delimiter /
-  quotechar; the sniffed dialect's ``\\r\\n`` line terminator applies, a
-  formatting change that keeps the output valid CSV).
+* csv: dialect sniffed from a bounded sample over a RESTRICTED delimiter set
+  (``, ; \\t |``; fallback ``excel``); every cell — the header row included,
+  hostnames live there — is scrubbed individually and rewritten with the same
+  dialect (same delimiter / quotechar; the sniffed dialect's ``\\r\\n`` line
+  terminator applies, a formatting change that keeps the output valid CSV).
+  Constraining the delimiters stops :class:`csv.Sniffer` picking a character
+  INSIDE the data on degenerate single-column content (a column of IPs would
+  otherwise sniff delimiter ``'1'`` and reassemble raw addresses cell-by-cell).
 * json: whole-document ``json.loads`` -> recursive value walk ->
   ``json.dumps(indent=2, ensure_ascii=False)`` (a formatting change,
   documented in the design doc).
@@ -52,11 +58,17 @@ _SNIFF_SAMPLE = 64 * 1024
 def _csv_dialect(text: str):
     """Sniff the CSV dialect from a bounded sample, falling back to ``excel``.
 
-    A sample the Sniffer cannot make sense of (single column, empty file, …)
-    is not fatal — ``excel`` reads such content as one cell per line, which
-    still round-trips every character through ``scrub``."""
+    Sniffing is constrained to plausible field separators (``, ; \\t |``).
+    Left unconstrained, :class:`csv.Sniffer` will happily pick a character
+    INSIDE the data as the delimiter on degenerate single-column content — a
+    column of IPs yields delimiter ``'1'`` (splitting ``10.0.0.1`` into cells
+    that reassemble the raw address untouched), a column of MACs yields ``':'``
+    — smuggling the PII straight through the per-cell scrub. On ANY sniff
+    failure (a sample with none of those delimiters — single column, empty
+    file, …) fall back to ``excel``, which reads the content as one cell per
+    line so every character still round-trips through ``scrub``."""
     try:
-        return csv.Sniffer().sniff(text[:_SNIFF_SAMPLE])
+        return csv.Sniffer().sniff(text[:_SNIFF_SAMPLE], delimiters=",;\t|")
     except csv.Error:
         return csv.excel
 
@@ -91,17 +103,47 @@ def _scrub_csv(text: str, rel: str, scrub: ScrubFn, budget: int) -> tuple[str, i
 
 
 def _scrub_json_value(obj, cell):
-    """Recursively scrub every string VALUE in a decoded JSON structure.
+    """Recursively scrub a decoded JSON structure through ``cell``.
 
-    Dict keys are left untouched (an aliased key would change the schema and
-    break downstream field access — decision #7); non-string scalars (numbers,
-    booleans, null) pass through as-is."""
+    Every string VALUE is scrubbed. Dict KEYS are scrubbed too — a JSON key is
+    always a string, and pre-v4 the whole-document text path aliased PII wherever
+    it sat, keys included; leaving keys raw is a leak (an IP-keyed or email-keyed
+    object ships its PII untouched). A scrubbed key still holds a string (the
+    alias) and aliases are unique, so distinct source keys stay distinct — the
+    one exception being the theoretical case where two DISTINCT source keys scrub
+    to the SAME string (e.g. one key is raw PII and another is already that PII's
+    alias text). The dict rebuild below resolves that deterministically as
+    LAST-WINS (the later key/value overwrites), which is acceptable: both keys
+    carried the same aliased identity anyway.
+
+    Numeric scalars (int/float) are rendered to text and scrubbed: a Luhn-valid
+    card number or an IP-shaped value typed as a JSON number must not survive
+    just because of its type. If scrubbing rewrote the rendered form the ALIAS
+    STRING replaces the number (an intended int/float -> str type change,
+    matching the pre-v4 text path in effect); an untouched number passes through
+    unchanged. Booleans and null are left untouched — a ``bool`` is an ``int``
+    subclass, so it is filtered out BEFORE the numeric branch."""
     if isinstance(obj, str):
         return cell(obj)
     if isinstance(obj, list):
         return [_scrub_json_value(v, cell) for v in obj]
     if isinstance(obj, dict):
-        return {k: _scrub_json_value(v, cell) for k, v in obj.items()}
+        scrubbed: dict = {}
+        for k, v in obj.items():
+            # JSON keys are always strings; scrub them like values. On a
+            # post-scrub duplicate key (two distinct source keys aliasing to the
+            # same string) the later assignment wins — deterministic last-wins.
+            new_k = cell(k) if isinstance(k, str) else k
+            scrubbed[new_k] = _scrub_json_value(v, cell)
+        return scrubbed
+    if isinstance(obj, bool):
+        return obj
+    if isinstance(obj, (int, float)):
+        rendered = str(obj)
+        replaced = cell(rendered)
+        # A hit means the rendered number carried PII -> ship the alias string
+        # (type change is intentional); no hit -> keep the original number.
+        return replaced if replaced != rendered else obj
     return obj
 
 
