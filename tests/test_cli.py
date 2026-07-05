@@ -130,3 +130,34 @@ def test_none_leaves_defaults():
     cfg = _merge_cli_into_config(Config(), _ns())  # both None
     assert cfg.max_bytes == default.max_bytes
     assert cfg.stream_threshold == default.stream_threshold
+
+
+def test_unknown_extract_disable_name_rejected():
+    # A typo like "pacp" (or the wrong handler name "sqlite3") must fail fast:
+    # silently ignoring it would leave extraction ON and drop the source
+    # binaries the operator meant to preserve.
+    for bad in ("pacp", "sqlite3"):
+        try:
+            _merge_cli_into_config(Config(), _ns(extract_disable=[bad]))
+        except SystemExit as e:
+            assert "unknown extractor" in str(e.code) and bad in str(e.code)
+            continue
+        raise AssertionError(f"expected SystemExit for --extract-disable {bad}")
+
+
+def test_known_extract_disable_name_accepted():
+    cfg = _merge_cli_into_config(Config(), _ns(extract_disable=["pcap", "archive"]))
+    assert cfg.extract.disable == {"pcap", "archive"}
+
+
+def test_unknown_extract_disable_from_config_table_rejected():
+    # The same validation must cover names coming from the [extract] TOML table,
+    # not only the CLI flag.
+    cfg = Config()
+    cfg.extract.disable = {"office", "bogus"}
+    try:
+        _merge_cli_into_config(cfg, _ns())
+    except SystemExit as e:
+        assert "bogus" in str(e.code)
+        return
+    raise AssertionError("expected SystemExit for a bad [extract].disable name")

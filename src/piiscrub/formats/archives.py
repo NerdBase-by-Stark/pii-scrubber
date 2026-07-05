@@ -50,6 +50,7 @@ import os
 import tarfile
 import tempfile
 import zipfile
+import zlib
 from pathlib import Path, PurePosixPath
 from typing import Iterator
 
@@ -342,7 +343,11 @@ def _process_zip(path: Path, rel: str, out_path: Path | None,
                 raise ExtractError(f"decompressed size exceeds max_out_bytes ({limits.max_out_bytes})")
             try:
                 data = zin.read(info)
-            except (RuntimeError, zipfile.BadZipFile) as e:
+            except (RuntimeError, zipfile.BadZipFile, zlib.error, EOFError) as e:
+                # Bad CRC (BadZipFile), broken deflate stream (zlib.error),
+                # encrypted member (RuntimeError), or truncated member (EOFError)
+                # — fail the whole archive open to copy-through + flag rather than
+                # letting a non-ExtractError abort the run.
                 raise ExtractError(f"cannot read member {name!r}: {e}") from e
             running += len(data)
 
@@ -616,7 +621,7 @@ def _iter_text(data: bytes, name: str, rel: str, limits: ExtractLimits,
         else:
             yield from _iter_text_single(data, name, comp, rel, limits, depth)
     except (zipfile.BadZipFile, tarfile.TarError, OSError, EOFError,
-            lzma.LZMAError, RuntimeError):
+            lzma.LZMAError, RuntimeError, zlib.error):
         return
 
 
@@ -658,7 +663,7 @@ def _iter_text_zip(data: bytes, rel: str, limits: ExtractLimits,
                 return
             try:
                 mdata = z.read(info)
-            except (RuntimeError, zipfile.BadZipFile):
+            except (RuntimeError, zipfile.BadZipFile, zlib.error, EOFError):
                 continue
             running += len(mdata)
             yield from _yield_member_text(name, mdata, rel, limits, depth)

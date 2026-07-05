@@ -413,3 +413,110 @@ def test_process_raises_for_unreadable_and_leaves_no_output(tmp_path: Path):
         h.process(bad, "bad.zip", out, lambda r, t: (t, 0),
                   write=True, limits=ExtractLimits())
     assert not out.exists()
+
+
+# ----------------------------------------------------------------------
+# Corrupt / truncated tar must fail open to copy-through, not abort the run
+# (regression: getmembers()/member read raised tarfile.ReadError uncaught).
+
+def test_truncated_tar_falls_back_to_copy_and_flag(tmp_path: Path):
+    src = tmp_path / "src"; dst = tmp_path / "dst"; src.mkdir()
+    # A member whose DATA block spans well past the cut: getmembers() sees a
+    # valid header (declared size 3000) but the member read hits EOF and
+    # tarfile raises ReadError('unexpected end of data').
+    full = _targz_bytes({"big.log": "ip 10.0.0.9\n" * 250}, comp="")
+    (src / "cut.tar").write_bytes(full[:700])
+    stats = _run(src, dst)   # must NOT raise
+    assert stats.files_extracted == 0 and stats.files_copied == 1
+    assert (dst / "cut.tar").read_bytes() == (src / "cut.tar").read_bytes()
+    assert any("cut.tar" in w and "may contain PII" in w for w in stats.warnings)
+
+
+def test_truncated_targz_falls_back_to_copy(tmp_path: Path):
+    src = tmp_path / "src"; dst = tmp_path / "dst"; src.mkdir()
+    full = _targz_bytes({"a.log": "ip 10.0.0.9\n" * 500}, comp="gz")
+    (src / "cut.tar.gz").write_bytes(full[:len(full) - 40])   # truncate the gz tail
+    stats = _run(src, dst)   # must NOT raise
+    assert stats.files_extracted == 0 and stats.files_copied == 1
+    assert (dst / "cut.tar.gz").read_bytes() == (src / "cut.tar.gz").read_bytes()
+
+
+# ----------------------------------------------------------------------
+# --extract-disable / [extract].disable is honored for archive MEMBERS, not
+# only top-level files: a disabled extractor's member is copied through
+# unchanged + flagged, so the original binary survives the repack.
+
+def _pcap_bytes(payload: bytes) -> bytes:
+    import struct
+    magic = b"\xd4\xc3\xb2\xa1"
+    out = bytearray(magic)
+    out += struct.pack("<HHiIII", 2, 4, 0, 0, 65535, 1)   # header, linktype eth
+    eth = (b"\x11\x22\x33\x44\x55\x66\xaa\xbb\xcc\xdd\xee\x01"
+           + struct.pack(">H", 0x0800) + payload)
+    out += struct.pack("<IIII", 1, 0, len(eth), len(eth)) + eth
+    return bytes(out)
+
+
+def test_disabled_extractor_not_run_on_archive_member(tmp_path: Path):
+    src = tmp_path / "src"; dst = tmp_path / "dst"; src.mkdir()
+    pcap = _pcap_bytes(b"filler payload bytes here")
+    (src / "bundle.zip").write_bytes(_zip_bytes({
+        "cap.pcap": pcap, "app.log": "ip 10.0.0.9\n"}))
+    stats = _run(src, dst, extract=ExtractConfig(disable={"pcap"}))
+    assert stats.files_extracted == 1        # the zip itself still repacks
+    with zipfile.ZipFile(dst / "bundle.zip") as z:
+        names = z.namelist()
+        # the pcap member is preserved raw (NOT replaced by cap.pcap.txt), the
+        # text member is still scrubbed.
+        assert "cap.pcap" in names and "cap.pcap.txt" not in names
+        assert z.read("cap.pcap") == pcap
+        assert "10.0.0.9" not in z.read("app.log").decode()
+    assert any("cap.pcap" in w and "copied unchanged" in w for w in stats.warnings)
+
+
+def test_disabled_extractor_run_on_archive_member_when_enabled(tmp_path: Path):
+    # Sanity opposite of the above: with pcap enabled the member IS dissected.
+    src = tmp_path / "src"; dst = tmp_path / "dst"; src.mkdir()
+    pcap = _pcap_bytes(b"filler payload bytes here")
+    (src / "bundle.zip").write_bytes(_zip_bytes({"cap.pcap": pcap}))
+    _run(src, dst)   # extraction on by default
+    with zipfile.ZipFile(dst / "bundle.zip") as z:
+        assert z.namelist() == ["cap.pcap.txt"]
+
+
+# ----------------------------------------------------------------------
+# Member-name collision inside a repack: a dissected derivative and a sibling
+# plain file that share the derivative's name must both survive (one renamed).
+
+def test_member_name_collision_deduped_in_repack(tmp_path: Path):
+    src = tmp_path / "src"; dst = tmp_path / "dst"; src.mkdir()
+    pcap = _pcap_bytes(b"filler bytes")
+    (src / "mix.zip").write_bytes(_zip_bytes({
+        "cap.pcap": pcap,                       # -> cap.pcap.txt derivative
+        "cap.pcap.txt": "plain note 10.0.0.9\n",  # already named cap.pcap.txt
+    }))
+    stats = _run(src, dst)
+    with zipfile.ZipFile(dst / "mix.zip") as z:
+        names = z.namelist()
+        assert len(names) == 2 and len(set(names)) == 2   # no silent overwrite
+        assert "cap.pcap.txt" in names
+        assert any(n.startswith("cap.pcap.txt.dup") for n in names)
+
+
+# ----------------------------------------------------------------------
+# verify: a cap that stops archive recursion early must surface as a finding,
+# never silently pass as clean (fail-closed guarantee otherwise hollow).
+
+def test_verify_truncated_archive_scan_reports_finding(tmp_path: Path):
+    dst = tmp_path / "dst"; dst.mkdir()
+    # A leak sits in the 3rd member, beyond a max_members=2 verify cap.
+    (dst / "big.zip").write_bytes(_zip_bytes({
+        "a.log": "clean\n", "b.log": "clean\n",
+        "c.log": "leak leak@evil.com 203.0.113.9\n",
+    }))
+    res = audit.verify_tree(
+        dst, build_active(),
+        extract=ExtractConfig(limits=ExtractLimits(max_members=2)))
+    assert res["clean"] is False
+    cats = {l["category"] for l in res["leaks"]}
+    assert "archive-scan-truncated" in cats

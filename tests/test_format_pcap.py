@@ -435,6 +435,23 @@ def test_max_out_bytes_trips_extracterror(tmp_path: Path):
         run(tmp_path, raw, limits=ExtractLimits(max_out_bytes=64))
 
 
+def test_input_size_guard_trips_before_read(tmp_path: Path):
+    # Regression: process() slurped the whole capture with path.read_bytes()
+    # before any guard; a multi-GB pcap OOMed and MemoryError (not ExtractError)
+    # aborted the run. The input-size guard now fails open to copy+flag when the
+    # capture is larger than max_out_bytes, WITHOUT reading it into RAM.
+    pkt = eth("11:22:33:44:55:66", "aa:bb:cc:dd:ee:20", 0x0800,
+              ipv4("10.9.0.1", "10.9.0.9", 17, udp(1, 2, b"payload here")))
+    raw = classic_pcap([(1, 0, pkt)])
+    src = tmp_path / "big.pcap"
+    src.write_bytes(raw)
+    with pytest.raises(ExtractError) as ei:
+        get_handler(".pcap").process(
+            src, "big.pcap", None, _scrub_factory(AliasMap()), write=False,
+            limits=ExtractLimits(max_out_bytes=len(raw) - 1))
+    assert "max_out_bytes" in str(ei.value)
+
+
 def test_dns_compression_pointer_loop_guard(tmp_path: Path):
     # DNS query whose name is a compression pointer that points at itself.
     header = struct.pack(">HHHHHH", 1, 0x0100, 1, 0, 0, 0)
@@ -487,3 +504,38 @@ def test_shared_aliasmap_same_ip_same_alias(tmp_path: Path):
     _, text, _ = run(tmp_path, classic_pcap([(1, 0, pkt)]), amap=amap)
     assert log_alias in text                       # cross-source correlation
     assert "10.40.0.7" not in text
+
+
+def test_project_vault_pcap_cross_run_aliasing(tmp_path: Path):
+    """A --project vault run over a pcap must keep cross-run aliasing: the same
+    IP dissected out of a capture in two separate strip runs sharing one vault
+    gets the SAME alias (the walker's scrub closure must correlate against the
+    persisted-and-reloaded AliasMap, not a fresh one)."""
+    import re
+
+    from piiscrub.cli import main
+
+    pkt = eth("11:22:33:44:55:66", "aa:bb:cc:dd:ee:30", 0x0800,
+              ipv4("10.55.0.7", "10.55.0.9", 17,
+                   udp(1, 2, b"contact dave@example.org")))
+    raw = classic_pcap([(1, 0, pkt)])
+    proj = tmp_path / "vault"
+
+    def one_run(n: int) -> str:
+        src = tmp_path / f"src{n}"
+        src.mkdir()
+        (src / "cap.pcap").write_bytes(raw)
+        dst = tmp_path / f"dst{n}"
+        rc = main(["strip", str(src), str(dst), "--project", str(proj),
+                   "--no-progress"])
+        assert rc == 0
+        return (dst / "cap.pcap.txt").read_text()
+
+    body1 = one_run(1)
+    body2 = one_run(2)
+    ip_aliases_1 = set(re.findall(r"<IP_\d+>", body1))
+    email_aliases_1 = set(re.findall(r"<EMAIL_\d+>", body1))
+    assert ip_aliases_1 and ip_aliases_1 == set(re.findall(r"<IP_\d+>", body2))
+    assert email_aliases_1 == set(re.findall(r"<EMAIL_\d+>", body2))
+    for raw_val in ("10.55.0.7", "10.55.0.9", "dave@example.org"):
+        assert raw_val not in body1 and raw_val not in body2

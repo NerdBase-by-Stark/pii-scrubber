@@ -5,8 +5,8 @@ them with :mod:`zipfile` + :mod:`xml.etree.ElementTree` (stdlib only — never
 ``openpyxl``/``python-docx``) and produces a *text derivative* rather than a
 re-serialised document:
 
-* ``report.docx`` / ``deck.pptx`` -> ``…​.txt`` (one line per paragraph),
-* ``book.xlsx``                  -> ``…​.csv`` (``# sheet: <name>`` sections,
+* ``report.docx`` / ``deck.pptx`` -> ``….txt`` (one line per paragraph),
+* ``book.xlsx``                  -> ``….csv`` (``# sheet: <name>`` sections,
   one CSV line per row).
 
 Rationale (design doc, decision #3): re-writing OOXML risks corrupt documents,
@@ -32,6 +32,7 @@ import posixpath
 import re
 import xml.etree.ElementTree as ET
 import zipfile
+import zlib
 from pathlib import Path
 
 from . import register
@@ -382,12 +383,14 @@ class _OfficeHandler:
             # zipfile raises RuntimeError("File is encrypted ...") when reading an
             # encrypted member of an otherwise-openable container.
             raise ExtractError(f"encrypted OOXML member: {e}") from e
-        except (zipfile.BadZipFile, NotImplementedError, EOFError, OSError) as e:
-            # A member with a bad CRC / truncated data raises BadZipFile, and an
-            # unsupported compression method raises NotImplementedError, from
-            # ``zf.read`` INSIDE the body (central directory intact, member bytes
-            # corrupt). Convert to ExtractError so the walker falls back to
-            # copy-through + flag instead of aborting the whole run.
+        except (zipfile.BadZipFile, NotImplementedError, EOFError, OSError,
+                zlib.error) as e:
+            # A member with a bad CRC raises BadZipFile, a broken deflate stream
+            # raises zlib.error, an unsupported compression method raises
+            # NotImplementedError — all from ``zf.read`` INSIDE the body (central
+            # directory intact, member bytes corrupt). Convert to ExtractError so
+            # the walker falls back to copy-through + flag instead of aborting the
+            # whole run.
             raise ExtractError(f"corrupt OOXML member: {e}") from e
 
         text = "\n".join(lines)

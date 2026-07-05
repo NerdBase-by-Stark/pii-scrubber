@@ -91,6 +91,11 @@ if extract_enabled and (h := get_handler(path.suffix)) and h.name not in extract
 * Streaming: extracted text is scrubbed whole (a pcap's text expansion is
   bounded by `max_out_bytes`); no chunk-streaming inside handlers for v3.
   Members/dissections larger than `max_out_bytes` → `ExtractError`.
+  **Known trade-off:** with extraction on by default, a directory of several
+  large captures/archives near the 512 MB `max_out_bytes` cap can create real
+  memory pressure (whole expanded text held in memory per file, sequentially).
+  Operators can lower `max_out_bytes` in `[extract]`; chunk-streaming inside
+  handlers is the documented fast-follow if this bites in practice.
 
 ### CLI / config
 
@@ -122,7 +127,10 @@ Stdlib `struct` parsing. Support:
   `if_tsresol` respected for timestamps (default 1 µs).
 * **Link types**: Ethernet (1) incl. 802.1Q VLAN (recursively strip tags),
   Linux SLL (113), Linux SLL2 (276), Raw IPv4/IPv6 (101, 228, 229),
-  Null/Loopback (0). Unknown link type → hex-preview line, not an error.
+  Null/Loopback (0). Unknown link type → a note line
+  (`# link unknown type=N len=L`) plus printable-string extraction of the frame
+  — **never** a hex dump of it (see the no-raw-hex invariant below), and not an
+  error.
 * **Dissection per packet** (text lines, one block per packet):
   * header: `# packet N ts=<ISO8601> caplen=X origlen=Y`
   * L2: `eth <src-mac> -> <dst-mac> type=0xXXXX [vlan N]`

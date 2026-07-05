@@ -375,6 +375,59 @@ def test_max_out_bytes_guard_trips(tmp_path: Path):
     assert not (tmp_path / "out" / "big.docx.txt").exists()
 
 
+def _corrupt_member(path: Path, member: str) -> None:
+    """Flip bytes inside a stored zip member so its CRC no longer matches; the
+    central directory stays intact so ZipFile(path) still OPENS, but zf.read of
+    that member raises zipfile.BadZipFile('Bad CRC-32 ...')."""
+    raw = bytearray(path.read_bytes())
+    marker = member.encode()
+    i = raw.find(marker)          # first hit is the local file header name
+    assert i >= 0
+    # Corrupt bytes well past the header/name, inside the compressed payload.
+    for j in range(i + len(marker) + 8, i + len(marker) + 12):
+        raw[j] ^= 0xFF
+    path.write_bytes(bytes(raw))
+
+
+def test_corrupt_member_bad_crc_raises_extracterror(tmp_path: Path):
+    # Regression: a docx whose word/document.xml member has corrupt bytes (bad
+    # CRC) made zf.read raise BadZipFile, which was NOT converted to ExtractError
+    # and aborted the whole run. It must now fail open to copy+flag.
+    doc = tmp_path / "torn.docx"
+    make_docx(doc, ["contact alice@example.com from 10.0.0.9"])
+    _corrupt_member(doc, "word/document.xml")
+    amap = AliasMap()
+    out_path = tmp_path / "out" / "torn.docx"
+    with pytest.raises(ExtractError):
+        _process(doc, amap, out_path=out_path, write=True)
+    assert not (tmp_path / "out" / "torn.docx.txt").exists()
+
+
+def test_walker_corrupt_member_falls_back_to_copy_flag(tmp_path: Path):
+    src = tmp_path / "src"; dst = tmp_path / "dst"; src.mkdir()
+    doc = src / "torn.docx"
+    make_docx(doc, ["contact alice@example.com from 10.0.0.9"])
+    _corrupt_member(doc, "word/document.xml")
+    original = doc.read_bytes()
+    stats = process_tree(src, dst, build_active(), AliasMap(), max_bytes=10**9,
+                         write=True, exclude_dirs=set())   # must NOT raise
+    assert stats.files_extracted == 0 and stats.files_copied == 1
+    assert (dst / "torn.docx").read_bytes() == original
+    assert not (dst / "torn.docx.txt").exists()
+
+
+def test_declared_size_bomb_pre_check_trips(tmp_path: Path):
+    # A member whose DECLARED uncompressed size dwarfs max_out_bytes must be
+    # rejected BEFORE zf.read materialises it (mirrors archives.py). Highly
+    # compressible content gives a small on-disk file with a large file_size.
+    doc = tmp_path / "bomb.docx"
+    make_docx(doc, ["A" * 200_000])   # deflates tiny, declares ~200 KB+
+    amap = AliasMap()
+    with pytest.raises(ExtractError) as ei:
+        _process(doc, amap, limits=ExtractLimits(max_out_bytes=1000))
+    assert "max_out_bytes" in str(ei.value)
+
+
 # ----------------------------------------------------------------------
 # scan (write=False) and reverse round-trip
 

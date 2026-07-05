@@ -286,3 +286,37 @@ def test_report_and_manifest_record_extracted(tmp_path, dummy_handler):
     assert rec["source_sha256"] == manifest_mod.hash_file(src / "note.dummy")
     assert rec["output_sha256"] == manifest_mod.hash_file(dst / "note.dummy.txt")
     assert rec["source_sha256"] != rec["output_sha256"]
+
+
+def test_derivative_name_collision_with_sibling_preserves_both(tmp_path, dummy_handler):
+    # Regression: a derivative (note.dummy -> note.dummy.txt) whose name equals a
+    # real sibling source file (a plain note.dummy.txt, exactly the layout the
+    # old export-to-text hint told operators to create) silently overwrote one
+    # of them and misattributed the manifest. Both outputs must now survive with
+    # distinct content and correct per-source manifest hashes.
+    src = tmp_path / "src"; dst = tmp_path / "dst"
+    src.mkdir()
+    (src / "note.dummy").write_bytes(b"dissected ip 10.0.0.9")
+    (src / "note.dummy.txt").write_text("plain sibling mail a@b.com\n",
+                                        encoding="utf-8")
+    amap = AliasMap()
+    stats = process_tree(src, dst, build_active(), amap, max_bytes=10**9,
+                         write=True, exclude_dirs=set())
+
+    # The plain sibling keeps its exact name; the derivative is relocated.
+    plain = (dst / "note.dummy.txt").read_text()
+    assert "a@b.com" not in plain and "<EMAIL_1>" in plain      # scrubbed sibling
+    deriv_rec = next(r for r in stats.extracted if r.rel == "note.dummy")
+    assert deriv_rec.out_rel != "note.dummy.txt"                # relocated
+    deriv_body = (dst / deriv_rec.out_rel).read_text()
+    assert "10.0.0.9" not in deriv_body and "<IP_1>" in deriv_body
+    assert any("collides" in w for w in stats.warnings)
+
+    # Manifest attributes each output to the RIGHT source (distinct hashes).
+    manifest = manifest_mod.build_manifest(src, dst, stats, timestamp="t", version="v")
+    rec_pcapish = next(r for r in manifest["files"] if r["file"] == "note.dummy")
+    rec_plain = next(r for r in manifest["files"] if r["file"] == "note.dummy.txt")
+    assert rec_pcapish["output_file"] == deriv_rec.out_rel
+    assert rec_pcapish["output_sha256"] == manifest_mod.hash_file(dst / deriv_rec.out_rel)
+    assert rec_plain["output_sha256"] == manifest_mod.hash_file(dst / "note.dummy.txt")
+    assert rec_pcapish["output_sha256"] != rec_plain["output_sha256"]

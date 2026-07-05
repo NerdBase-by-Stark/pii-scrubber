@@ -281,6 +281,66 @@ piiscrub reverse ./out-syslog-v2/app.log ./app.restored.log \
 
 ---
 
+## Format extraction (binary formats — ON by default)
+
+By default `scan`/`strip` **dissect or repack** supported binary formats into
+scrubbed output instead of copying the raw binary (which would carry PII) into
+the shareable tree:
+
+| Source | Output | Notes |
+|--------|--------|-------|
+| `capture.pcap` / `.pcapng` / `.cap` | `capture.pcap.txt` | per-packet dissection + printable payload strings, all tokenised |
+| `report.docx`, `deck.pptx` | `…​.txt` | paragraph / slide / notes text + author core-props |
+| `book.xlsx` | `book.xlsx.csv` | one CSV line per row, `# sheet:` sections |
+| `data.db` / `.sqlite` / `.sqlite3` | `data.db.txt` | every user table dumped read-only; BLOBs as `<blob N bytes>` |
+| `logs.zip`, `logs.tar.gz`, `f.gz` … | same name, repacked | each member scrubbed by the same rules (recursively) |
+
+The **original binary is not copied** when a derivative is produced; the report's
+`extracted` section records the `src → out` mapping and member counts. Anything
+that cannot be fully/safely read — corrupt, encrypted/password-protected, a
+tripped size/depth/member guard — **fails open**: the original is copied through
+unchanged and flagged "may contain PII" (the pre-extraction behaviour).
+
+Formats with **no** built-in extractor (`.evtx` / `.etl` / `.pdf`) are still
+copied through + flagged with an export-to-text hint; export them first
+(`wevtutil qe FILE /lf:true /f:text > out.txt`) then re-run on the text.
+
+### Turning it off
+
+```bash
+# restore the old copy-through + flag for every binary (verify also skips
+# archive recursion — a documented weaker guarantee):
+piiscrub strip ./src ./out --no-extract
+
+# keep original .pcap captures intact for a downstream tool, but still scrub
+# everything else (repeatable; also honored for members INSIDE archives):
+piiscrub strip ./src ./out --extract-disable pcap
+```
+
+An unknown extractor name (a typo like `pacp`, or `sqlite3` instead of `sqlite`)
+is rejected immediately rather than silently leaving extraction on. Valid names:
+`pcap`, `archive`, `office`, `sqlite`.
+
+Equivalent `piiscrub.toml`:
+
+```toml
+[extract]
+enabled = true                 # false == --no-extract
+disable = ["pcap"]             # per-format opt-out (names above)
+max_out_bytes = 536870912      # 512 MB cap on expanded text per source file
+max_depth = 3                  # nested-archive recursion cap
+max_members = 50000            # member / row cap
+```
+
+### Reversing extracted output
+
+A `.txt` / `.csv` derivative is plain text + aliases, so `piiscrub reverse`
+rehydrates it directly against the decode map / vault. For a **repacked
+`.zip`/`.tar`**, unzip it first, then run `reverse` on each extracted text
+member with the same map — the members are ordinary scrubbed text.
+
+---
+
 ## Verifying an existing stripped tree
 
 You can re-run the fail-closed residual-PII check on any stripped tree at any
@@ -291,7 +351,11 @@ piiscrub verify ./acme-clean
 ```
 
 It exits `0` when the tree is clean, or `10` and prints the findings (residual
-PII and any stray decode/report sidecars) when it is not.
+PII and any stray decode/report sidecars) when it is not. With extraction on
+(the default) it **recurses into repacked archives** and scans their text
+members too, reporting any leak with `archive.zip!member/path` notation; a scan
+stopped early by a size/member cap is itself reported so a partially-scanned
+archive never passes as clean. `--no-extract` skips that recursion.
 
 ---
 

@@ -332,10 +332,47 @@ is stored under `runs/<timestamp>/`.
 * **Encoding:** BOM detection (UTF-8 / UTF-16 / UTF-32) → else strict UTF-8 →
   else cp1252. Output is re-encoded in the detected encoding (UTF-16/32 keep
   their BOM).
-* **Binary / undecodable files** (a NUL byte in the first 4 KB, or a known
-  binary extension such as `.pcap .evtx .xlsx .docx .zip .png`) are **copied
-  through unchanged and flagged** in the report as "may contain PII" — never
-  silently half-stripped.
+* **Format extraction (ON by default).** Supported binary formats are
+  **dissected/repacked into scrubbed output** rather than copied through raw:
+  * `.pcap` / `.pcapng` / `.cap` → a scrubbed text dissection `capture.pcap.txt`
+    (per-packet fields + printable payload strings, all tokenised);
+  * `.docx` / `.pptx` → `report.docx.txt`, `.xlsx` → `book.xlsx.csv` (visible
+    text / cells / slide notes / author core-props);
+  * `.db` / `.sqlite` / `.sqlite3` → `data.db.txt` (every user table dumped
+    CSV-ish, read-only open, BLOBs shown as `<blob N bytes>`, never hex);
+  * `.zip` / `.tar[.gz|.bz2|.xz]` / `.tgz` / single-file `.gz` `.bz2` `.xz` →
+    **repacked in the same format** with every member scrubbed by this same
+    decision tree (text tokenised; supported binary member dissected; unknown
+    binary member copied in + flagged).
+
+  The **original binary is not copied into the output** when a derivative is
+  produced (it would carry the very PII we scrubbed); the report's `extracted`
+  section records the `src → out` mapping. Anything that cannot be fully and
+  safely read (corrupt/encrypted/oversized/too-deeply-nested) **fails open**:
+  the original is copied through unchanged and flagged "may contain PII", exactly
+  like the pre-extraction behaviour.
+* **Turning extraction off / partially off.**
+  * `--no-extract` restores the old behaviour: every binary is copied through
+    unchanged and flagged (on `verify` it also skips archive recursion — a
+    documented weaker guarantee).
+  * `--extract-disable NAME` (repeatable) disables one extractor by name
+    (`pcap` | `archive` | `office` | `sqlite`); its files — **including members
+    inside archives** — are copied through unchanged + flagged instead of
+    dissected. An unknown name is rejected fast rather than silently ignored.
+  * The `[extract]` TOML table sets the same options plus the guard rails
+    (`disable`, `max_out_bytes`, `max_depth`, `max_members`); see
+    [`docs/USAGE.md`](docs/USAGE.md).
+* **Still export-to-text first** for formats with **no** built-in extractor —
+  `.evtx` / `.etl` (`wevtutil qe … /f:text`) and `.pdf`: these are copied
+  through + flagged with the export hint, then re-run on the exported text.
+* **Reversing a repacked archive.** A derivative `.txt`/`.csv` reverses directly
+  with `piiscrub reverse` (it is text + aliases). For a repacked `.zip`/`.tar`,
+  unzip it and run `reverse` on each extracted text member with the same decode
+  map / vault.
+* **Binary / undecodable files** with no extractor (a NUL byte in the first
+  4 KB, or a binary extension such as `.png` `.exe` `.pdf`, or a
+  `--no-extract`/disabled format) are **copied through unchanged and flagged** in
+  the report as "may contain PII" — never silently half-stripped.
 * **Adaptive streaming for huge files.** Files at or below `stream_threshold`
   (default 50 MB) are processed whole, which preserves multi-line token
   detection (e.g. PEM private-key blocks). Larger files are processed in
@@ -350,9 +387,8 @@ is stored under `runs/<timestamp>/`.
   pollutes the JSON on stdout) and auto-disables when stderr is not a TTY. Use
   `--no-progress` to silence it.
 
-Format extractors for archives/structured binaries (evtx/xlsx/zip) remain on the
-backlog — see
-[`docs/plans/2026-06-18-pii-scrubber-design.md`](docs/plans/2026-06-18-pii-scrubber-design.md).
+`.evtx` binary-XML parsing (and `.pdf` / `.msg`) remain out of scope — see
+[`docs/plans/2026-07-05-format-extractors-design.md`](docs/plans/2026-07-05-format-extractors-design.md).
 
 ---
 

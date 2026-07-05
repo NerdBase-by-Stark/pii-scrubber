@@ -385,3 +385,29 @@ def test_shared_alias_between_db_and_text(tmp_path: Path):
     # same IP -> identical alias across both outputs
     assert "<IP_1>" in db_body and "<IP_1>" in log_body
     assert "10.0.0.9" not in db_body and "10.0.0.9" not in log_body
+
+
+# ----------------------------------------------------------------------
+# URI encoding: a source filename containing URI metacharacters ('?', '#', '%')
+# must open the ACTUAL file, never a percent-decoded different path.
+
+@pytest.mark.parametrize("fname", ["we?rd.db", "ta#g.db", "a%62.db"])
+def test_uri_metachar_filenames_open_correct_db(tmp_path: Path, fname: str):
+    # A decoy file whose name is what a naive raw-path URI would decode/truncate
+    # to (e.g. 'a%62.db' -> 'ab.db', 'we?rd.db' -> 'we'); it holds DIFFERENT data
+    # that must NEVER be dumped in place of the real file's data.
+    real = tmp_path / fname
+    _make_db(real, {"t": (["ip"], [("10.0.0.9",)])})
+    for decoy in ("ab.db", "we", "ta"):
+        d = tmp_path / decoy
+        if not d.exists():
+            _make_db(d, {"t": (["ip"], [("203.0.113.7",)])})
+    amap = AliasMap()
+    out = tmp_path / "out" / fname
+    oc = _handler().process(real, fname, out, _scrub_closure(amap),
+                            write=True, limits=ExtractLimits())
+    body = (tmp_path / "out" / (fname + ".txt")).read_text()
+    # the real file's IP was seen (aliased); the decoy's IP never leaks in.
+    assert oc.replacements == 1
+    assert "203.0.113.7" not in body
+    assert "<IP_1>" in body
