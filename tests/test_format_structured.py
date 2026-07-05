@@ -171,6 +171,29 @@ def test_jsonl_per_line_valid_and_blank_lines_preserved(tmp_path: Path):
     assert rec2["tags"][0].startswith("<EMAIL_") and rec2["tags"][1] == 7
 
 
+def test_jsonl_crlf_blank_line_preserved_as_empty(tmp_path: Path):
+    """CRLF-terminated JSONL: a blank line must round-trip as "" not "\\r".
+    ``text.split("\\n")`` leaves a trailing \\r on each line, so the blank-line
+    handling must strip it or blank lines corrupt to the literal '\\r'."""
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    (src / "events.jsonl").write_bytes(
+        b'{"host": "10.0.0.1"}\r\n'
+        b"\r\n"
+        b'{"host": "10.0.0.2"}\r\n'
+    )
+    stats = _run(src, dst)
+
+    assert stats.files_extracted == 1
+    body = (dst / "events.jsonl").read_text(encoding="utf-8")
+    assert "10.0.0.1" not in body and "10.0.0.2" not in body
+    lines = body.split("\n")
+    assert lines[1] == "" and "\r" not in body   # blank stays empty, no stray CR
+    assert json.loads(lines[0])["host"].startswith("<IP_")
+    assert json.loads(lines[2])["host"].startswith("<IP_")
+
+
 # ----------------------------------------------------------------------
 # Broken structured input -> TEXT path fallback (never copy-through raw PII).
 

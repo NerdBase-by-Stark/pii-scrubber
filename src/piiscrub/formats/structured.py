@@ -188,7 +188,11 @@ def _scrub_jsonl(text: str, rel: str, scrub: ScrubFn, budget: int) -> tuple[str,
 
     out_lines: list[str] = []
     used = 0
-    for i, line in enumerate(text.split("\n"), 1):
+    for i, raw_line in enumerate(text.split("\n"), 1):
+        # Drop a trailing \r so CRLF-terminated input keeps blank-line fidelity
+        # (a blank CRLF line is "\r" after split, not "") and lines round-trip
+        # the same as walker._iter_lines handles them.
+        line = raw_line[:-1] if raw_line.endswith("\r") else raw_line
         if not line.strip():
             out_lines.append(line)
             continue

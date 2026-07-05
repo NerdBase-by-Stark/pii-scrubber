@@ -115,6 +115,19 @@ def test_multicast_mac_prefix():
     assert "<MACMC_1>" in out
 
 
+def test_multicast_mac_cisco_dotted_prefix():
+    """A Cisco dotted multicast MAC (``0100.5e00.0001``, from the Cisco MAC
+    detector) must also read its first byte's group bit and get ``MACMC`` — the
+    separator differs ('.') but the group bit is the same."""
+    dets = _dets()
+    amap = AliasMap()
+    style = make_structured_style(amap)
+    out, reps = tokenize("mc 0100.5e00.0001 uni dead.beef.0011", dets, amap, style=style)
+    aliases = [r.alias for r in reps if r.category == "mac"]
+    assert "<MACMC_1>" in aliases          # 0100.5e00 (multicast, group bit set)
+    assert "<MAC_1>" in aliases            # dead.beef (unicast group bit clear)
+
+
 def test_shared_net_sequence_across_v4_and_v6():
     """NET labels are one first-seen sequence shared across families: v4 subnets
     take NET1/NET2, then a v6 /64 takes NET3 (net_key disambiguates)."""

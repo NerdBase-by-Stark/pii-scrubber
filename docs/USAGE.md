@@ -458,7 +458,7 @@ keep_wellknown = true            # default; set false to also tokenise 224.0.1.1
 eye: a packet capture, a syslog file, and a CSV asset export — all mentioning
 the same core switch by its IP, `192.0.2.10` (RFC 5737 `TEST-NET-1`):
 
-```
+```text
 diagnostics/
 ├── capture.pcap      # a PTPv2 Announce: 192.0.2.10 -> multicast 224.0.1.129
 ├── device.syslog     # an SSH login on the same switch
@@ -474,7 +474,7 @@ sw-core01,192.0.2.10,HQ
 
 `device.syslog` (before, one line):
 
-```
+```text
 2026-07-05T09:12:04Z sw-core01 sshd[1200]: Accepted publickey for admin from 192.0.2.10 port 51000
 ```
 
@@ -488,7 +488,7 @@ Resulting layout — the pcap and syslog derivatives are reshaped to `.jsonl`;
 `inventory.csv` keeps its own name and format (field-aware output is not
 re-wrapped):
 
-```
+```text
 diagnostics-clean/
 ├── capture.pcap.jsonl
 ├── device.syslog.jsonl

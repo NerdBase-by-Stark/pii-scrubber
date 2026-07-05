@@ -238,9 +238,12 @@ def make_structured_style(amap: AliasMap) -> Callable[[Detector, str], str]:
             net6 = ipaddress.ip_network(f"{value}/64", strict=False)
             return f"IPV6_{amap.net_label('v6:' + str(net6.network_address))}"
         if cat == "mac":
-            first = re.split(r"[:-]", value, maxsplit=1)[0]
+            # Strip separators to the raw hex so colon (aa:bb:..), hyphen
+            # (aa-bb-..) AND Cisco dotted (aabb.ccdd.eeff) forms all read the
+            # same first byte — the group bit lives in its low bit.
+            hexonly = re.sub(r"[^0-9A-Fa-f]", "", value)
             try:
-                octet = int(first, 16)
+                octet = int(hexonly[:2], 16)
             except ValueError:
                 return det.prefix
             if octet & 1:  # group bit set => multicast MAC
