@@ -404,6 +404,50 @@ def test_truncated_final_packet_keeps_output(tmp_path: Path):
     assert outcome.kind == "derivative"
 
 
+def _classic_pcap_caplen(pkt_full: bytes, incl: int, *, endian: str = "<",
+                         linktype: int = 1) -> bytes:
+    """Classic pcap with a SINGLE record whose incl_len (caplen) is ``incl`` but
+    orig_len is the full ``len(pkt_full)`` — i.e. the packet was TRUNCATED at
+    capture time (snaplen), the routine tcpdump case. Only ``incl`` bytes are
+    stored, so the file itself is complete (not a truncated-final-record)."""
+    magic = b"\xd4\xc3\xb2\xa1" if endian == "<" else b"\xa1\xb2\xc3\xd4"
+    out = bytearray(magic)
+    out += struct.pack(endian + "HHiIII", 2, 4, 0, 0, 65535, linktype)
+    out += struct.pack(endian + "IIII", 1, 0, incl, len(pkt_full))
+    out += pkt_full[:incl]
+    return bytes(out)
+
+
+def test_caplen_truncated_packet_drops_cut_final_run(tmp_path: Path):
+    # A snaplen-truncated packet (caplen < origlen) whose captured bytes end
+    # mid-token must NOT emit that final printable run: cutting an email before
+    # its TLD ('bob.smith@stark-r') yields a fragment no detector matches, so it
+    # would be written RAW into the derivative and slip past verify (audit fix 2).
+    body = b"From: bob.smith@stark-records.com\r\n"
+    pkt_full = eth("11:22:33:44:55:66", "aa:bb:cc:dd:ee:20", 0x0800,
+                   ipv4("198.51.100.4", "198.51.100.9", 6, tcp(51000, 80, body)))
+    # Chop the trailing 'ecords.com\r\n' (12 bytes) so the captured payload ends
+    # exactly at '...stark-r'.
+    incl = len(pkt_full) - 12
+    _, text, _ = run(tmp_path, _classic_pcap_caplen(pkt_full, incl))
+    assert "caplen=" in text and "# packet 1" in text
+    # The cut fragment is gone entirely — neither the fragment nor a raw email.
+    assert "stark-r" not in text
+    assert "bob.smith" not in text
+
+
+def test_full_packet_still_emits_final_run(tmp_path: Path):
+    # Contrast with the truncation case: when caplen == origlen the final run is
+    # a genuine token boundary and MUST still be emitted (and its email aliased),
+    # so the fix does not over-drop complete payloads.
+    body = b"From: bob.smith@stark-records.com\r\n"
+    pkt = eth("11:22:33:44:55:66", "aa:bb:cc:dd:ee:21", 0x0800,
+              ipv4("198.51.100.4", "198.51.100.9", 6, tcp(51000, 80, body)))
+    _, text, _ = run(tmp_path, classic_pcap([(1, 0, pkt)]))
+    assert "bob.smith@stark-records.com" not in text   # raw email scrubbed
+    assert "<EMAIL_" in text                            # but it WAS captured/aliased
+
+
 def test_bad_magic_raises_extracterror(tmp_path: Path):
     src = tmp_path / "bad.pcap"
     src.write_bytes(b"not-a-pcap-file at all, definitely bytes here")

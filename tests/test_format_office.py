@@ -431,6 +431,49 @@ def test_declared_size_bomb_pre_check_trips(tmp_path: Path):
     assert "max_out_bytes" in str(ei.value)
 
 
+def _minimal_xlsx_with_cell_ref(path: Path, ref: str, value: str) -> None:
+    """Write a minimal single-sheet xlsx whose one cell uses the raw ``ref``."""
+    workbook = (f'{XMLDECL}<workbook xmlns="{NS_S}" xmlns:r="{NS_R}">'
+                f'<sheets><sheet name="S" sheetId="1" r:id="rId1"/></sheets>'
+                f'</workbook>')
+    rels = (f'{XMLDECL}<Relationships xmlns="{NS_PKG}">'
+            f'<Relationship Id="rId1" Type="{NS_R}/worksheet" '
+            f'Target="worksheets/sheet1.xml"/></Relationships>')
+    sheet = (f'{XMLDECL}<worksheet xmlns="{NS_S}"><sheetData>'
+             f'<row r="1"><c r="{ref}"><v>{value}</v></c></row>'
+             f'</sheetData></worksheet>')
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("xl/workbook.xml", workbook)
+        z.writestr("xl/_rels/workbook.xml.rels", rels)
+        z.writestr("xl/worksheets/sheet1.xml", sheet)
+
+
+def test_col_index_clamped_to_excel_max():
+    from piiscrub.formats.office import _MAX_COL, _col_index
+    assert _col_index("A1") == 1
+    assert _col_index("AB12") == 28
+    assert _col_index("XFD1") == _MAX_COL           # Excel's real last column
+    # A crafted over-long ref decodes to billions without the clamp; clamped it
+    # can never exceed the real maximum.
+    assert _col_index("ZZZZZZZZ1") == _MAX_COL
+
+
+def test_crafted_cell_ref_does_not_oom_and_extracts(tmp_path: Path):
+    # A tiny xlsx whose only cell is r="ZZZZZZZZ1" decodes (unclamped) to a column
+    # index of ~2.2e11, and _emit_sheet would try to build a row list of that many
+    # cells -> MemoryError (NOT ExtractError) -> the whole run aborts. The _MAX_COL
+    # clamp keeps the row bounded so extraction completes normally (audit fix 4).
+    book = tmp_path / "crafted.xlsx"
+    _minimal_xlsx_with_cell_ref(book, "ZZZZZZZZ1", "leak@evil.com")
+    amap = AliasMap()
+    out = _process(book, amap, out_path=tmp_path / "crafted.xlsx", write=True)
+    assert out.kind == "derivative" and out.out_rel == "crafted.xlsx.csv"
+    body = (tmp_path / "crafted.xlsx.csv").read_text()
+    assert "leak@evil.com" not in body and "<EMAIL_1>" in body
+    # The row is clamped, not gigabytes: the derivative stays small.
+    assert len(body) < 200_000
+
+
 # ----------------------------------------------------------------------
 # scan (write=False) and reverse round-trip
 
