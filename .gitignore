@@ -26,3 +26,4 @@ decode.json
 # OS
 .DS_Store
 Thumbs.db
+/verify-evidence/
