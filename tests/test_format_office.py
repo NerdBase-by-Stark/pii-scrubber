@@ -11,6 +11,7 @@ garbage container or malformed primary XML falls open to :class:`ExtractError`.
 from __future__ import annotations
 
 import io
+import os
 import zipfile
 from pathlib import Path
 
@@ -500,3 +501,45 @@ def test_walker_bad_office_falls_back_to_copy_flag(tmp_path: Path):
     assert (dst / "broken.docx").read_bytes() == b"not a zip"
     warn = next(w for w in stats.warnings if "broken.docx" in w)
     assert "may contain PII" in warn and "extraction skipped" in warn
+
+
+# ----------------------------------------------------------------------
+# Derivative-write failure must fail OPEN to copy-through + flag, never abort
+# the whole run (audit fix 3). A source whose name + ".txt" exceeds NAME_MAX
+# (255 on ext4/NTFS) raises OSError(ENAMETOOLONG) on the derivative write; the
+# handler must convert it to ExtractError so the walker copies the ORIGINAL
+# through under its (shorter) name instead of dying mid-run.
+
+def test_walker_office_write_enametoolong_falls_back_to_copy_flag(tmp_path: Path):
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    long_name = "d" * 249 + ".docx"          # 254 chars; + ".txt" = 258 > 255
+    make_docx(src / long_name, ["email jack@corp.com"])
+    # A second, normal doc after it proves the run does NOT abort mid-way.
+    make_docx(src / "ok.docx", ["email jill@corp.com"])
+
+    stats = process_tree(src, dst, build_active(), AliasMap(), max_bytes=10**9,
+                         write=True, exclude_dirs=set())
+
+    # The long-named docx copied through unchanged + flagged (NOT aborted).
+    assert (dst / long_name).read_bytes() == (src / long_name).read_bytes()
+    assert not os.path.exists(str(dst / (long_name + ".txt")))
+    warn = next(w for w in stats.warnings if long_name in w)
+    assert "may contain PII" in warn and "could not write derivative" in warn
+    # The following file was still extracted -> the run continued.
+    assert (dst / "ok.docx.txt").exists()
+    assert stats.files_extracted == 1 and stats.files_copied == 1
+
+
+def test_office_handler_write_error_raises_extracterror_not_oserror(tmp_path: Path):
+    # Unit-level: the handler itself converts the write OSError to ExtractError
+    # (after deleting any partial derivative), per the base.py fail-open contract.
+    src = tmp_path / "s.docx"
+    make_docx(src, ["email jack@corp.com"])
+    out = tmp_path / ("o" * 250 + ".docx")   # out.name + ".txt" exceeds NAME_MAX
+    h = get_handler(".docx")
+    with pytest.raises(ExtractError):
+        h.process(src, "s.docx", out, lambda r, t: (t, 0),
+                  write=True, limits=ExtractLimits())
+    assert not os.path.exists(str(out) + ".txt")

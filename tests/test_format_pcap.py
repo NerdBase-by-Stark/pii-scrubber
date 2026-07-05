@@ -539,3 +539,60 @@ def test_project_vault_pcap_cross_run_aliasing(tmp_path: Path):
     assert email_aliases_1 == set(re.findall(r"<EMAIL_\d+>", body2))
     for raw_val in ("10.55.0.7", "10.55.0.9", "dave@example.org"):
         assert raw_val not in body1 and raw_val not in body2
+
+
+# ===========================================================================
+# Payload-string cap must never cut a printable run MID-TOKEN (audit fix 1):
+# slicing an overflowing run at ``_PAYLOAD_STR_CAP - emitted`` could leave a
+# raw un-aliased PII fragment (email local-part / hostname) that no longer
+# matches a detector shape and would leak into the DST derivative.
+
+def test_payload_cap_drops_overflow_run_no_mid_token_leak(tmp_path: Path):
+    # A first printable run fills the cap to 4080/4096; the SECOND run holds a
+    # raw email whose emission would overflow. The old code sliced it to 16
+    # chars ("contact bob.smit") — leaking "bob.smit" raw. The fix drops the
+    # whole overflowing run, so no fragment of the email survives.
+    filler = b"A" * 4080
+    email_run = b"contact bob.smith@stark-records.com"
+    body = filler + b"\x00" + email_run
+    pkt = eth("11:22:33:44:55:66", "aa:bb:cc:dd:ee:20", 0x0800,
+              ipv4("10.30.0.1", "10.30.0.9", 6, tcp(51000, 80, body)))
+    _, text, _ = run(tmp_path, classic_pcap([(1, 0, pkt)]))
+    # No raw fragment of the email — neither the full value nor a mid-token slice.
+    assert "bob.smith@stark-records.com" not in text
+    assert "bob.smit" not in text
+    assert "bob.sm" not in text
+    # The under-cap first run is still emitted; the truncation note is present.
+    assert 'payload "' + "A" * 4080 + '"' in text
+    assert "payload strings truncated" in text
+
+
+def test_payload_cap_later_short_run_still_emitted(tmp_path: Path):
+    # After a run is dropped for overflow, a subsequent run that still fits under
+    # the cap must be emitted (dropping is per-run, not "stop for the packet").
+    body = (b"A" * 4080 + b"\x00"
+            + b"toolongrunthatwilloverflowthecap_" * 2 + b"\x00"
+            + b"ok42")
+    pkt = eth("11:22:33:44:55:66", "aa:bb:cc:dd:ee:21", 0x0800,
+              ipv4("10.31.0.1", "10.31.0.9", 6, tcp(51000, 80, body)))
+    _, text, _ = run(tmp_path, classic_pcap([(1, 0, pkt)]))
+    assert 'payload "ok42"' in text
+    assert "payload strings truncated" in text
+
+
+# ===========================================================================
+# DNS name decoding must cap TOTAL decoded length, not just jump count (audit
+# fix 8): compression pointers re-walk labels from each target, so an unbounded
+# name amplifies ~129x in memory before any sink budget applies.
+
+def test_decode_name_total_length_capped_against_pointer_bomb():
+    from piiscrub.formats.pcap import _decode_name
+
+    # 200 one-char labels, then a compression pointer back to offset 0. Without a
+    # length cap the 128-jump loop re-walks all 200 labels per jump -> ~25 600
+    # labels (a multi-KB..MB string). The cap stops the name at ~255 bytes.
+    body = (b"\x01a") * 200 + b"\xc0\x00"      # pointer to offset 0 (itself)
+    name, _next = _decode_name(body, 0)
+    # Bounded well under what an uncapped decode would produce (~25 600 labels).
+    assert len(name) < 600
+    assert name.count(".") < 300

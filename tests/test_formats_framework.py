@@ -320,3 +320,38 @@ def test_derivative_name_collision_with_sibling_preserves_both(tmp_path, dummy_h
     assert rec_pcapish["output_sha256"] == manifest_mod.hash_file(dst / deriv_rec.out_rel)
     assert rec_plain["output_sha256"] == manifest_mod.hash_file(dst / "note.dummy.txt")
     assert rec_pcapish["output_sha256"] != rec_plain["output_sha256"]
+
+
+def test_derivative_collision_guard_is_case_insensitive(tmp_path, dummy_handler):
+    # Audit fix 10: on case-insensitive filesystems (Windows/NTFS, macOS/APFS)
+    # 'X.DUMMY.txt' (a derivative of 'X.DUMMY') and a plain sibling 'x.dummy.txt'
+    # are the SAME file, so a case-SENSITIVE collision check let the derivative
+    # silently clobber the sibling and misattribute the manifest. The guard must
+    # detect the case-folded collision and relocate the derivative.
+    src = tmp_path / "src"; dst = tmp_path / "dst"
+    src.mkdir()
+    (src / "X.DUMMY").write_bytes(b"dissected ip 10.0.0.9")
+    (src / "x.dummy.txt").write_text("plain sibling mail a@b.com\n", encoding="utf-8")
+    amap = AliasMap()
+    stats = process_tree(src, dst, build_active(), amap, max_bytes=10**9,
+                         write=True, exclude_dirs=set())
+
+    deriv_rec = next(r for r in stats.extracted if r.rel == "X.DUMMY")
+    # Case-folded collision detected -> derivative relocated off 'X.DUMMY.txt'.
+    assert deriv_rec.out_rel.casefold() != "x.dummy.txt"
+    assert deriv_rec.out_rel.endswith(".dup1")
+    assert any("collides" in w for w in stats.warnings)
+
+    # Both outputs survive with distinct, correctly-scrubbed content.
+    plain = (dst / "x.dummy.txt").read_text()
+    assert "a@b.com" not in plain and "<EMAIL_1>" in plain
+    deriv_body = (dst / deriv_rec.out_rel).read_text()
+    assert "10.0.0.9" not in deriv_body and "<IP_1>" in deriv_body
+
+    # Manifest attributes each output to the right source (distinct hashes).
+    manifest = manifest_mod.build_manifest(src, dst, stats, timestamp="t", version="v")
+    rec_deriv = next(r for r in manifest["files"] if r["file"] == "X.DUMMY")
+    rec_plain = next(r for r in manifest["files"] if r["file"] == "x.dummy.txt")
+    assert rec_deriv["output_file"] == deriv_rec.out_rel
+    assert rec_deriv["output_sha256"] == manifest_mod.hash_file(dst / deriv_rec.out_rel)
+    assert rec_plain["output_sha256"] == manifest_mod.hash_file(dst / "x.dummy.txt")

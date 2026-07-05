@@ -520,3 +520,206 @@ def test_verify_truncated_archive_scan_reports_finding(tmp_path: Path):
     assert res["clean"] is False
     cats = {l["category"] for l in res["leaks"]}
     assert "archive-scan-truncated" in cats
+
+
+# ======================================================================
+# Audit round-2 regression tests.
+
+import os
+import struct
+
+
+def _pcap_member_bytes(payload: bytes = b"GET /x HTTP/1.1 printable payload abcdefghij") -> bytes:
+    """A minimal single-packet classic pcap (Ethernet/IPv4/TCP) whose dissected
+    text derivative is larger than the raw bytes (used to exercise the
+    expansion-budget debit)."""
+    import socket
+    ip = (struct.pack(">BBHHHBBH", 0x45, 0, 20 + 20 + len(payload), 0x1234, 0, 64, 6, 0)
+          + socket.inet_aton("10.0.0.1") + socket.inet_aton("10.0.0.2")
+          + struct.pack(">HHIIHHHH", 4000, 80, 0, 0, (5 << 12) | 0x18, 65535, 0, 0)
+          + payload)
+    eth = (b"\x11\x22\x33\x44\x55\x66\xaa\xbb\xcc\xdd\xee\x01"
+           + struct.pack(">H", 0x0800) + ip)
+    out = bytearray(b"\xd4\xc3\xb2\xa1")
+    out += struct.pack("<HHiIII", 2, 4, 0, 0, 65535, 1)     # linktype ethernet
+    out += struct.pack("<IIII", 1, 0, len(eth), len(eth)) + eth
+    return bytes(out)
+
+
+def _zip_with_encrypted_flag(members: dict[str, str | bytes],
+                             encrypted: set[str]) -> bytes:
+    """Build a normal zip then flip ONLY the general-purpose 'encrypted' bit
+    (0x01) on the local + central headers of the members named in ``encrypted``.
+
+    The bytes stay readable (we only set the flag) so verify can still decode the
+    OTHER, unflagged members — exactly what strip's copy+flag fallback places in
+    DST for an encrypted zip (the ORIGINAL archive, plaintext members and all)."""
+    raw = bytearray(_zip_bytes(members))
+    i = 0
+    while (i := raw.find(b"PK\x03\x04", i)) >= 0:      # local file headers
+        nlen = int.from_bytes(raw[i + 26:i + 28], "little")
+        name = raw[i + 30:i + 30 + nlen].decode("utf-8", "replace")
+        if name in encrypted:
+            raw[i + 6] |= 0x01
+        i += 4
+    i = 0
+    while (i := raw.find(b"PK\x01\x02", i)) >= 0:      # central directory headers
+        nlen = int.from_bytes(raw[i + 28:i + 30], "little")
+        name = raw[i + 46:i + 46 + nlen].decode("utf-8", "replace")
+        if name in encrypted:
+            raw[i + 8] |= 0x01
+        i += 4
+    return bytes(raw)
+
+
+# --- Fix 2: verify recursion into single-file .gz must fail CLOSED when the
+# inner stream exceeds the cap (was: silent return -> planted leak passes).
+
+def test_verify_single_file_gz_over_cap_reports_truncated(tmp_path: Path):
+    dst = tmp_path / "dst"; dst.mkdir()
+    inner = b"leak carol@evil.com 203.0.113.9\n" + b"x" * 240
+    (dst / "logs.gz").write_bytes(gzip.compress(inner))
+    res = audit.verify_tree(
+        dst, build_active(),
+        extract=ExtractConfig(limits=ExtractLimits(max_out_bytes=100)))
+    assert res["clean"] is False
+    cats = {l["category"] for l in res["leaks"]}
+    assert "archive-scan-truncated" in cats
+    assert any("logs.gz" in l["file"] for l in res["leaks"])
+
+
+def test_verify_single_file_gz_under_cap_still_catches_leak(tmp_path: Path):
+    # Control: within the cap the inner text is scanned normally and the planted
+    # leak is caught as a real finding (not the truncation sentinel).
+    dst = tmp_path / "dst"; dst.mkdir()
+    (dst / "note.gz").write_bytes(gzip.compress(b"leak dave@evil.com 203.0.113.9\n"))
+    res = audit.verify_tree(dst, build_active())
+    assert res["clean"] is False
+    cats = {l["category"] for l in res["leaks"]}
+    assert "email" in cats and "archive-scan-truncated" not in cats
+
+
+# --- Fix 4: iter_text_members must not slurp a huge DST archive into RAM; an
+# archive larger than the cap fails CLOSED (SCAN_TRUNCATED), never MemoryError.
+
+def test_verify_oversize_archive_reports_truncated_not_read(tmp_path: Path):
+    dst = tmp_path / "dst"; dst.mkdir()
+    (dst / "big.zip").write_bytes(_zip_bytes({"m/plain.log": "leak eve@evil.com 203.0.113.9\n"}))
+    size = (dst / "big.zip").stat().st_size
+    # Cap set BELOW the on-disk archive size -> the size guard trips before read.
+    res = audit.verify_tree(
+        dst, build_active(),
+        extract=ExtractConfig(limits=ExtractLimits(max_out_bytes=size - 1)))
+    assert res["clean"] is False
+    cats = {l["category"] for l in res["leaks"]}
+    assert "archive-scan-truncated" in cats
+
+
+def test_iter_text_members_oversize_yields_only_sentinel(tmp_path: Path):
+    from piiscrub.formats.archives import iter_text_members, SCAN_TRUNCATED
+    z = tmp_path / "a.zip"
+    z.write_bytes(_zip_bytes({"x.log": "ip 203.0.113.9\n"}))
+    limits = ExtractLimits(max_out_bytes=z.stat().st_size - 1)
+    out = list(iter_text_members(z, "a.zip", limits))
+    assert len(out) == 1 and out[0][1] is SCAN_TRUNCATED
+
+
+# --- Fix 5: verify of a copied-through zip with an encrypted member must scan
+# the readable plaintext members regardless of member ORDER (deterministic).
+
+@pytest.mark.parametrize("order", [
+    ["locked.bin", "plain.log"],     # encrypted FIRST (the failing case)
+    ["plain.log", "locked.bin"],     # plaintext first
+])
+def test_verify_encrypted_member_order_independent(tmp_path: Path, order):
+    dst = tmp_path / "dst"; dst.mkdir()
+    members = {name: ("john.doe@example.com / 10.1.2.3\n" if name == "plain.log"
+                      else "opaque-cipher-bytes") for name in order}
+    data = _zip_with_encrypted_flag(members, encrypted={"locked.bin"})
+    (dst / "mix.zip").write_bytes(data)
+    res = audit.verify_tree(dst, build_active())
+    assert res["clean"] is False
+    files = {l["file"] for l in res["leaks"]}
+    cats = {l["category"] for l in res["leaks"]}
+    assert "mix.zip!plain.log" in files
+    assert "email" in cats and "ipv4" in cats
+
+
+# --- Fix 7: single-file .gz derivative write failure (ENAMETOOLONG) must fail
+# OPEN to copy-through + flag, never abort the run.
+
+def test_single_file_gz_write_enametoolong_falls_back(tmp_path: Path):
+    src = tmp_path / "src"; dst = tmp_path / "dst"; src.mkdir()
+    long_name = "a" * 245 + ".pcap.gz"       # 253 chars; deriv +'.txt' = 257 > 255
+    (src / long_name).write_bytes(gzip.compress(_pcap_member_bytes()))
+    (src / "ok.log.gz").write_bytes(gzip.compress(b"ip 10.0.0.9\n"))
+    stats = _run(src, dst)                    # must NOT raise
+    assert (dst / long_name).read_bytes() == (src / long_name).read_bytes()
+    assert not os.path.exists(str(dst / (long_name + ".txt")))
+    warn = next(w for w in stats.warnings if long_name in w)
+    assert "may contain PII" in warn and "could not write derivative" in warn
+    # the following compressed file was still processed -> run continued
+    assert (dst / "ok.log.gz").exists()
+
+
+# --- Fix 9: _bad_name must not misclassify a POSIX member whose name merely has
+# a ':' at index 1 as Windows drive-absolute.
+
+def test_bad_name_colon_at_index_one_is_not_drive_absolute():
+    from piiscrub.formats.archives import _bad_name
+    # POSIX-legal names with a colon that are NOT drive-absolute:
+    assert _bad_name("a:notes.txt") is False
+    assert _bad_name("t: results.log") is False
+    assert _bad_name("x:y/z.txt") is False
+    # Genuine drive-absolute / UNC / traversal are still rejected:
+    assert _bad_name("C:/evil.txt") is True
+    assert _bad_name("C:\\evil.txt") is True
+    assert _bad_name("C:") is True
+    assert _bad_name("/etc/passwd") is True
+    assert _bad_name("\\\\host\\share") is True
+    assert _bad_name("../escape.txt") is True
+    # ordinary relative names pass:
+    assert _bad_name("dir/rel.txt") is False
+
+
+def test_posix_colon_member_survives_repack_and_is_scrubbed(tmp_path: Path):
+    src = tmp_path / "src"; dst = tmp_path / "dst"; src.mkdir()
+    (src / "bundle.tar").write_bytes(_targz_bytes(
+        {"a:notes.txt": "contact frank@corp.com ip 10.7.7.7\n"}, comp=""))
+    stats = _run(src, dst)
+    assert stats.files_extracted == 1
+    with tarfile.open(dst / "bundle.tar") as t:
+        assert "a:notes.txt" in t.getnames()
+        body = t.extractfile("a:notes.txt").read().decode()
+        assert "frank@corp.com" not in body and "10.7.7.7" not in body
+        assert "<EMAIL_1>" in body and "<IP_1>" in body
+    assert not any("unsafe path" in w for w in stats.warnings)
+
+
+# --- Fix 11: a nested handler's EXPANDED output must be debited from the
+# archive's running max_out_bytes budget, so total produced text stays bounded.
+
+def test_nested_expansion_debited_against_budget(tmp_path: Path):
+    src = tmp_path / "src"; dst = tmp_path / "dst"; src.mkdir()
+    pcap = _pcap_member_bytes()
+    members = {f"cap{i}.pcap": pcap for i in range(6)}
+    (src / "caps.zip").write_bytes(_zip_bytes(members))
+
+    # Raw member bytes sum well under the cap, but the six dissected derivatives
+    # (each larger than its raw member) do NOT: with the expansion debit the
+    # archive trips max_out_bytes and copies through + flags, rather than
+    # silently writing a repack several times the cap.
+    raw_sum = 6 * len(pcap)
+    cap = raw_sum + (len(pcap) // 2)          # fits raw, not the expanded text
+    stats = _run(src, dst, extract=ExtractConfig(limits=ExtractLimits(max_out_bytes=cap)))
+    assert stats.files_extracted == 0 and stats.files_copied == 1
+    assert (dst / "caps.zip").read_bytes() == (src / "caps.zip").read_bytes()
+    warn = next(w for w in stats.warnings if "caps.zip" in w)
+    assert "may contain PII" in warn
+
+    # Control: with a generous cap the same archive fully extracts all members.
+    dst2 = tmp_path / "dst2"
+    stats2 = _run(src, dst2)
+    assert stats2.files_extracted == 1
+    with zipfile.ZipFile(dst2 / "caps.zip") as z:
+        assert sorted(z.namelist()) == sorted(f"cap{i}.pcap.txt" for i in range(6))

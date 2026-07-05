@@ -120,10 +120,15 @@ def _bad_name(name: str) -> bool:
     if not name:
         return True
     norm = name.replace("\\", "/")
-    if norm.startswith("/"):
+    if norm.startswith("/"):    # POSIX-absolute, or UNC (``\\host`` -> ``//host``)
         return True
-    # Windows drive-absolute (``C:\...``) or UNC (``\\host``).
-    if len(norm) >= 2 and norm[1] == ":":
+    # Windows drive-absolute: an ALPHA drive letter, a colon, then a separator
+    # (``C:\...`` -> ``C:/...``) or the bare 2-char drive spec (``C:``). Requiring
+    # the letter + separator avoids misclassifying a POSIX-legal member name that
+    # merely has a colon at index 1 (e.g. ``a:notes.txt`` or ``t: results.log``),
+    # which would silently drop a harmless member from the repack.
+    if (len(norm) >= 2 and norm[0].isalpha() and norm[1] == ":"
+            and (len(norm) == 2 or norm[2] == "/")):
         return True
     return ".." in PurePosixPath(norm).parts
 
@@ -237,13 +242,20 @@ def _handle_member(
     limits: ExtractLimits,
     write: bool,
     remaining_budget: int,
-) -> tuple[str, bytes | None, bool, bool, int, list[str]]:
+) -> tuple[str, bytes | None, bool, bool, int, list[str], int]:
     """Apply the per-file decision tree to one archive member.
 
     Returns ``(out_name, out_data | None, processed, copied, replacements,
-    warnings)``. ``out_data`` is None in scan mode. ``processed`` marks a member
-    scrubbed as text or successfully nested-extracted; ``copied`` marks a binary
-    member carried through unchanged + flagged.
+    warnings, out_size)``. ``out_data`` is None in scan mode. ``processed`` marks
+    a member scrubbed as text or successfully nested-extracted; ``copied`` marks a
+    binary member carried through unchanged + flagged. ``out_size`` is the byte
+    length of the output this member contributes to the repack (a nested
+    handler's derivative can be much LARGER than the raw member — a pcap
+    dissection expands ~4x); the caller debits it from the archive's running
+    ``max_out_bytes`` budget so total expanded text stays bounded (see the call
+    sites). In scan mode the nested-handler output size is not materialised, so
+    ``out_size`` is 0 for that path (nothing is written; only the in-memory
+    per-member budget the handler already enforces applies).
 
     ``remaining_budget`` is what is left of the source file's ``max_out_bytes``
     after this archive's members read so far; a nested handler is capped to it so
@@ -275,23 +287,28 @@ def _handle_member(
             # Fail-open per member: copy the binary in unchanged and flag it.
             return (name, data if write else None, False, True, 0,
                     [f"member {name!r}: nested extraction skipped ({e}); "
-                     f"copied unchanged (may contain PII)"])
-        return out_name, out_data, True, False, reps, []
+                     f"copied unchanged (may contain PII)"],
+                    len(data))
+        out_size = len(out_data) if out_data is not None else 0
+        return out_name, out_data, True, False, reps, [], out_size
 
     if suffix in BINARY_EXTS or get_handler(suffix) is not None:
         # ``get_handler(...) is not None`` catches a DISABLED handler's suffix
         # that is not in BINARY_EXTS (e.g. ``.sqlite3``): still binary, copy+flag.
         return (name, data if write else None, False, True, 0,
-                [f"member {name!r}: binary type, copied unchanged (may contain PII)"])
+                [f"member {name!r}: binary type, copied unchanged (may contain PII)"],
+                len(data))
 
     decoded = decode_bytes(data)
     if decoded is None:
         return (name, data if write else None, False, True, 0,
-                [f"member {name!r}: not text-decodable, copied unchanged (may contain PII)"])
+                [f"member {name!r}: not text-decodable, copied unchanged (may contain PII)"],
+                len(data))
 
     text, enc = decoded
     scrubbed, reps = scrub(member_rel, text)
-    return name, (scrubbed.encode(enc) if write else None), True, False, reps, []
+    encoded = scrubbed.encode(enc)
+    return name, (encoded if write else None), True, False, reps, [], len(encoded)
 
 
 # ---------------------------------------------------------------------------
@@ -351,9 +368,19 @@ def _process_zip(path: Path, rel: str, out_path: Path | None,
                 raise ExtractError(f"cannot read member {name!r}: {e}") from e
             running += len(data)
 
-            out_name, out_data, processed, copied, reps, warns = _handle_member(
+            out_name, out_data, processed, copied, reps, warns, out_size = _handle_member(
                 name, data, rel, scrub, limits, write,
                 limits.max_out_bytes - running)
+            # Debit any EXPANSION the member's output added beyond its raw bytes
+            # (a nested pcap/office/sqlite derivative is larger than the raw
+            # member) so ``running`` tracks total PRODUCED text, not just raw
+            # decompressed bytes. Otherwise N expanding members could each grow up
+            # to the full remaining budget and the repack would exceed
+            # ``max_out_bytes`` by roughly the member count.
+            running += max(0, out_size - len(data))
+            if running > limits.max_out_bytes:
+                raise ExtractError(
+                    f"expanded size exceeds max_out_bytes ({limits.max_out_bytes})")
             total_reps += reps
             mproc += int(processed)
             mcopied += int(copied)
@@ -439,9 +466,15 @@ def _process_tar(path: Path, rel: str, out_path: Path | None, scrub: ScrubFn,
                 raise ExtractError(f"corrupt tar member {name!r}: {e}") from e
             running += len(data)
 
-            out_name, out_data, processed, copied, reps, warns = _handle_member(
+            out_name, out_data, processed, copied, reps, warns, out_size = _handle_member(
                 name, data, rel, scrub, limits, write,
                 limits.max_out_bytes - running)
+            # Debit expansion beyond raw bytes so ``running`` tracks total
+            # PRODUCED text (see the zip site for the rationale).
+            running += max(0, out_size - len(data))
+            if running > limits.max_out_bytes:
+                raise ExtractError(
+                    f"expanded size exceeds max_out_bytes ({limits.max_out_bytes})")
             total_reps += reps
             mproc += int(processed)
             mcopied += int(copied)
@@ -525,11 +558,22 @@ def _process_single(path: Path, rel: str, out_path: Path | None, scrub: ScrubFn,
             final_rel = rel + deriv_suffix
             if write and out_path is not None:
                 dest = out_path.parent / (out_path.name + deriv_suffix)
-                _atomic_write(dest, out_data or b"")
+                try:
+                    _atomic_write(dest, out_data or b"")
+                except OSError as e:
+                    # A write failure (e.g. ENAMETOOLONG when out_path.name +
+                    # deriv_suffix exceeds NAME_MAX) must not abort the whole run:
+                    # _atomic_write already removed its temp, so convert to
+                    # ExtractError and the walker copies the original through
+                    # under its (shorter) name + flags it.
+                    raise ExtractError(f"could not write derivative: {e}") from e
             return ExtractOutcome(kind="derivative", out_rel=final_rel, replacements=reps)
         # Inner was itself an archive: recompress its repack to the same format.
         if write and out_path is not None:
-            _atomic_write(out_path, _compress(out_data or b"", comp))
+            try:
+                _atomic_write(out_path, _compress(out_data or b"", comp))
+            except OSError as e:
+                raise ExtractError(f"could not write repack: {e}") from e
         return ExtractOutcome(kind="repack", out_rel=rel, replacements=reps)
 
     if inner_suffix in BINARY_EXTS:
@@ -541,7 +585,10 @@ def _process_single(path: Path, rel: str, out_path: Path | None, scrub: ScrubFn,
     text, enc = decoded
     scrubbed, reps = scrub(f"{rel}!inner", text)
     if write and out_path is not None:
-        _atomic_write(out_path, _compress(scrubbed.encode(enc), comp))
+        try:
+            _atomic_write(out_path, _compress(scrubbed.encode(enc), comp))
+        except OSError as e:
+            raise ExtractError(f"could not write repack: {e}") from e
     return ExtractOutcome(kind="repack", out_rel=rel, replacements=reps)
 
 
@@ -599,6 +646,21 @@ def iter_text_members(path: Path, rel: str, limits: ExtractLimits) -> Iterator[t
     nests further for archives inside archives). Best-effort: an unreadable or
     encrypted archive yields nothing (it was copied+flagged, not repacked)."""
     try:
+        size = path.stat().st_size
+    except OSError:
+        return
+    if size > limits.max_out_bytes:
+        # Size guard BEFORE slurping the archive into RAM. A huge copied-through
+        # archive in DST (e.g. a 20 GB zip that tripped max_out_bytes on strip and
+        # was copied+flagged) would otherwise be read whole and MemoryError —
+        # which is NOT an OSError — would abort the entire verify/strip run with a
+        # traceback. Fail CLOSED: an archive too big to scan under the cap yields
+        # SCAN_TRUNCATED so it can never pass verify as clean without a byte
+        # scanned. (Nested archives are already bounded because their bytes come
+        # from members debited against max_out_bytes in _iter_text_zip/_tar.)
+        yield f"{rel}!<scan truncated at cap>", SCAN_TRUNCATED
+        return
+    try:
         data = path.read_bytes()
     except OSError:
         return
@@ -652,8 +714,16 @@ def _iter_text_zip(data: bytes, rel: str, limits: ExtractLimits,
         running = 0
         seen = 0
         for info in z.infolist():
-            if info.flag_bits & 0x1:  # encrypted -> was copied+flagged, skip archive
-                return
+            if info.flag_bits & 0x1:
+                # Encrypted member: opaque, cannot be read/scanned. Skip ONLY this
+                # member and keep scanning the readable ones. Bailing on the whole
+                # archive here would make the verdict member-ORDER dependent — an
+                # encrypted-first entry would hide a readable plaintext member that
+                # still holds raw PII (the copy+flag fallback places the ORIGINAL
+                # encrypted zip, plaintext members and all, into DST). Scanning
+                # readable members regardless keeps verify deterministic and
+                # fail-closed.
+                continue
             name = info.filename
             if _bad_name(name) or name.endswith("/"):
                 continue
@@ -688,10 +758,19 @@ def _iter_text_tar(data: bytes, rel: str, limits: ExtractLimits,
 
 
 def _iter_text_single(data: bytes, name: str, comp: str, rel: str,
-                      limits: ExtractLimits, depth: int) -> Iterator[tuple[str, str]]:
+                      limits: ExtractLimits, depth: int) -> Iterator[tuple[str, object]]:
     try:
         inner = _decompress_capped(data, comp, limits.max_out_bytes)
-    except (OSError, EOFError, lzma.LZMAError, ExtractError):
+    except ExtractError:
+        # The inner stream exceeded max_out_bytes. Fail CLOSED exactly like the
+        # zip/tar member paths: a single-file .gz/.bz2/.xz in DST whose inner text
+        # is bigger than the cap must NOT silently pass verify as clean without a
+        # byte scanned — yield the sentinel so verify_tree records a finding.
+        yield f"{rel}!<scan truncated at cap>", SCAN_TRUNCATED
+        return
+    except (OSError, EOFError, lzma.LZMAError):
+        # Corrupt/unreadable stream: it was copied+flagged (not repacked), so
+        # there is nothing to re-scan — best-effort, like an unreadable archive.
         return
     yield from _yield_member_text(_strip_comp_suffix(name), inner, rel, limits, depth)
 

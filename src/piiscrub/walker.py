@@ -432,11 +432,20 @@ def process_tree(
     claimed_out_rels: set[str] = set()
 
     def _unique_out_rel(desired: str) -> str:
-        taken = reserved_rels | claimed_out_rels
-        if desired not in taken:
+        # Compare case-INSENSITIVELY: on case-insensitive filesystems (Windows/
+        # NTFS, macOS/APFS — the tool's primary pcap/evtx target platform)
+        # ``X.PCAP.txt`` and a plain sibling ``x.pcap.txt`` are the SAME file, so
+        # an exact-string check would let a derivative silently clobber (or be
+        # clobbered by) that sibling and misattribute the manifest. Fold case for
+        # the collision test but keep ``desired``'s original case for the output
+        # name. On case-sensitive filesystems this is merely conservative (it may
+        # relocate a derivative that would not truly collide) — safe either way.
+        taken = {r.casefold() for r in reserved_rels}
+        taken |= {r.casefold() for r in claimed_out_rels}
+        if desired.casefold() not in taken:
             return desired
         i = 1
-        while f"{desired}.dup{i}" in taken:
+        while f"{desired}.dup{i}".casefold() in taken:
             i += 1
         return f"{desired}.dup{i}"
 

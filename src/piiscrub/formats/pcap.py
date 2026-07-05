@@ -83,6 +83,7 @@ _IP_FRAG6 = 44       # IPv6 fragment extension header
 
 _PAYLOAD_STR_CAP = 4096   # max printable-string chars emitted per packet
 _MIN_RUN = 4              # shortest printable run worth emitting
+_MAX_DNS_NAME = 255       # RFC 1035 cap; also defeats compression-pointer bombs
 
 _DNS_TYPES = {1: "A", 2: "NS", 5: "CNAME", 6: "SOA", 12: "PTR", 15: "MX",
               16: "TXT", 28: "AAAA", 33: "SRV"}
@@ -165,14 +166,25 @@ def _emit_strings(data: bytes, sink: _Sink) -> None:
 
     def flush() -> None:
         nonlocal emitted, truncated
-        if len(run) >= _MIN_RUN and emitted < _PAYLOAD_STR_CAP:
-            s = run.decode("ascii")
-            if emitted + len(s) > _PAYLOAD_STR_CAP:
-                s = s[: _PAYLOAD_STR_CAP - emitted]
-                truncated = True
-            if s:
-                sink.add(f'payload "{s}"')
-                emitted += len(s)
+        if len(run) < _MIN_RUN:
+            return
+        if emitted >= _PAYLOAD_STR_CAP:
+            truncated = True
+            return
+        s = run.decode("ascii")
+        if emitted + len(s) > _PAYLOAD_STR_CAP:
+            # Emitting this run would overflow the per-packet cap. Drop the WHOLE
+            # run rather than slicing it at ``_PAYLOAD_STR_CAP - emitted``: a
+            # sliced run can cut a raw PII value (email local-part, hostname)
+            # mid-string, and the un-aliased fragment left behind no longer
+            # matches the detector shape, so it would be written raw into the DST
+            # derivative and verify could not catch it. Runs are token boundaries
+            # (separated by non-printable bytes), so dropping one whole run never
+            # splits a value; a later shorter run that still fits is emitted.
+            truncated = True
+            return
+        sink.add(f'payload "{s}"')
+        emitted += len(s)
 
     for byte in data:
         if 0x20 <= byte <= 0x7E:
@@ -198,11 +210,17 @@ def _decode_name(msg: bytes, offset: int) -> tuple[str, int]:
     Returns ``(name, next_offset)`` where ``next_offset`` is the position just
     after the name in the record stream (following the FIRST pointer, per the
     wire format). Compression pointers are followed with a hard cap of 128 jumps
-    so a self-referential / cyclic pointer chain can never loop forever."""
+    so a self-referential / cyclic pointer chain can never loop forever, AND the
+    total decoded name length is capped at :data:`_MAX_DNS_NAME` bytes. Without
+    the length cap, compression pointers re-walk labels from each target, so a
+    crafted port-53 packet (many labels + a back-pointer) amplifies into a
+    multi-megabyte string built entirely BEFORE the sink's ``max_out_bytes``
+    budget applies — a memory/CPU DoS. Real DNS names are capped at 255 bytes."""
     labels: list[str] = []
     pos = offset
     next_off: int | None = None
     jumps = 0
+    name_len = 0
     n = len(msg)
     while True:
         if pos >= n:
@@ -229,6 +247,12 @@ def _decode_name(msg: bytes, offset: int) -> tuple[str, int]:
             break
         labels.append(msg[pos:pos + length].decode("ascii", "replace"))
         pos += length
+        name_len += length + 1
+        if name_len > _MAX_DNS_NAME:
+            # Total name length cap: a legitimate DNS name never exceeds 255
+            # bytes; stopping here defeats compression-pointer amplification
+            # regardless of the jump count.
+            break
     if next_off is None:
         next_off = pos
     return ".".join(labels), next_off
@@ -764,9 +788,14 @@ class _PcapHandler:
                 deriv.parent.mkdir(parents=True, exist_ok=True)
                 deriv.write_text(scrubbed, encoding="utf-8", newline="")
             except OSError as e:
-                # Never leave a half-written derivative for the fallback path.
-                if deriv.exists():
+                # Never leave a half-written derivative for the fallback path,
+                # and never abort the run. The unlink is guarded because
+                # ``exists()``/``unlink`` on a too-long name itself raises OSError
+                # (ENAMETOOLONG), which would otherwise re-abort the run.
+                try:
                     deriv.unlink()
+                except OSError:
+                    pass
                 raise ExtractError(f"could not write derivative: {e}") from e
 
         return ExtractOutcome(

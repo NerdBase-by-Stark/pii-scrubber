@@ -146,11 +146,18 @@ class _SqliteHandler:
             deriv.parent.mkdir(parents=True, exist_ok=True)
             try:
                 deriv.write_text(scrubbed, encoding="utf-8")
-            except OSError:
-                # Never leave a half-written derivative behind on a write error.
-                if deriv.exists():
+            except OSError as e:
+                # Never leave a half-written derivative behind on a write error,
+                # AND never abort the whole run: convert to ExtractError so the
+                # walker falls back to copy-through + flag (which succeeds under
+                # the original, shorter name — e.g. when name + '.txt' exceeds
+                # NAME_MAX). The unlink is guarded because ``exists()``/``unlink``
+                # on a too-long name itself raises OSError.
+                try:
                     deriv.unlink()
-                raise
+                except OSError:
+                    pass
+                raise ExtractError(f"could not write derivative: {e}") from e
 
         return ExtractOutcome(kind="derivative", out_rel=out_rel, replacements=reps)
 

@@ -404,12 +404,22 @@ class _OfficeHandler:
             try:
                 deriv.parent.mkdir(parents=True, exist_ok=True)
                 deriv.write_text(scrubbed, encoding="utf-8")
-            except Exception:
+            except OSError as e:
                 # A failure mid-write must not leave a truncated derivative for
-                # the copy-through fallback to race with (fail-open invariant).
-                if deriv.exists():
+                # the copy-through fallback to race with (fail-open invariant),
+                # AND must not abort the whole run: convert to ExtractError so the
+                # walker copies the original through under its (shorter) name +
+                # flags it. Concretely, a source whose name + ext exceeds NAME_MAX
+                # raises OSError(ENAMETOOLONG) here; the copy-through fallback
+                # succeeds because it writes the original, shorter name.
+                # NB: unlink is guarded because ``Path.exists()``/``unlink`` on a
+                # too-long name itself raises OSError, which would otherwise mask
+                # the conversion and re-abort the run.
+                try:
                     deriv.unlink()
-                raise
+                except OSError:
+                    pass
+                raise ExtractError(f"could not write derivative: {e}") from e
         return ExtractOutcome(kind="derivative", out_rel=out_rel, replacements=n)
 
 

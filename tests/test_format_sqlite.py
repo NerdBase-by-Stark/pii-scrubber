@@ -419,3 +419,48 @@ def test_uri_metachar_filenames_open_correct_db(tmp_path: Path, fname: str):
     assert oc.replacements == 1
     assert "203.0.113.7" not in body
     assert "<IP_1>" in body
+
+
+# ----------------------------------------------------------------------
+# Derivative-write failure must fail OPEN to copy-through + flag, never abort
+# the whole run (audit fix 6), mirroring pcap/office. A source whose name +
+# ".txt" exceeds NAME_MAX raises OSError(ENAMETOOLONG) on the write; the handler
+# converts it to ExtractError so the walker copies the original through under
+# its (shorter) name and the run continues.
+
+def test_walker_sqlite_write_enametoolong_falls_back_to_copy_flag(tmp_path: Path):
+    import os
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    long_name = "d" * 250 + ".db"            # 253 chars; + ".txt" = 257 > 255
+    # Build under a short name first (sqlite's transient ``-journal`` sidecar
+    # would itself exceed NAME_MAX for the long name), then rename into place —
+    # the read-only immutable open the handler uses creates no sidecar.
+    _make_db(src / "seed.db", {"t": (["email"], [("alice@example.com",)])})
+    os.replace(src / "seed.db", src / long_name)
+    _make_db(src / "ok.db", {"t": (["email"], [("bob@example.com",)])})
+
+    stats = process_tree(src, dst, build_active(), AliasMap(), max_bytes=10**9,
+                         write=True, exclude_dirs=set())
+
+    # long-named db copied through unchanged + flagged, NOT aborted
+    assert (dst / long_name).read_bytes() == (src / long_name).read_bytes()
+    assert not os.path.exists(str(dst / (long_name + ".txt")))
+    warn = next(w for w in stats.warnings if long_name in w)
+    assert "may contain PII" in warn and "could not write derivative" in warn
+    # the following db was still extracted -> run continued
+    assert (dst / "ok.db.txt").exists()
+    assert stats.files_extracted == 1 and stats.files_copied == 1
+
+
+def test_sqlite_handler_write_error_raises_extracterror_not_oserror(tmp_path: Path):
+    import os
+    src = tmp_path / "data.db"
+    _make_db(src, {"t": (["email"], [("alice@example.com",)])})
+    out = tmp_path / ("o" * 251 + ".db")     # out.name + ".txt" exceeds NAME_MAX
+    h = get_handler(".db")
+    with pytest.raises(ExtractError):
+        h.process(src, "data.db", out, lambda r, t: (t, 0),
+                  write=True, limits=ExtractLimits())
+    assert not os.path.exists(str(out) + ".txt")
