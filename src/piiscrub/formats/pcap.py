@@ -73,6 +73,7 @@ _ET_ARP = 0x0806
 _ET_IPV6 = 0x86DD
 _ET_VLAN = 0x8100    # 802.1Q
 _ET_QINQ = 0x88A8    # 802.1ad
+_ET_PTP = 0x88F7     # IEEE 1588 PTP over Ethernet (L2, no IP/UDP)
 
 # IP protocol numbers.
 _IP_ICMP = 1
@@ -328,6 +329,129 @@ def _dissect_dns(payload: bytes, sink: _Sink, *, tcp: bool) -> None:
 
 
 # ---------------------------------------------------------------------------
+# PTP (Precision Time Protocol, IEEE 1588) dissection
+#
+# PTP frames carry device identities that leak the very MACs the L2 header does,
+# so the dissector renders them in detector-friendly forms (design decisions
+# #8/#9): a MAC-derived EUI-64 clockIdentity is emitted as its reconstructed
+# 6-byte MAC (colon-hex) so the MAC detector aliases it to the SAME <MAC_n> as
+# the device's L2 MAC (correlation preserved, leak closed); a non-MAC-derived
+# identity is emitted as canonical 8-group colon-hex for the ptp_clockid
+# detector. originTimestamp is surfaced verbatim and NEVER scrubbed (a cross-
+# source correlation key). Malformed PTP degrades to printable strings, never an
+# error, and raw payload hex is NEVER emitted (existing invariant).
+
+_PTP_V2_TYPES = {
+    0x0: "sync", 0x1: "delay_req", 0x2: "pdelay_req", 0x3: "pdelay_resp",
+    0x8: "follow_up", 0x9: "delay_resp", 0xA: "pdelay_resp_follow_up",
+    0xB: "announce", 0xC: "signaling", 0xD: "management",
+}
+
+# PTPv2 message types whose body begins with a 10-byte Timestamp at offset 34
+# (originTimestamp / preciseOriginTimestamp / receiveTimestamp). Announce also
+# carries one at @34 but is rendered by its dedicated branch below.
+_PTP_V2_TS_TYPES = frozenset({0x0, 0x1, 0x2, 0x3, 0x8, 0x9})
+
+_PTP_V1_CONTROL = {
+    0: "sync", 1: "delay_req", 2: "follow_up", 3: "delay_resp", 4: "management",
+}
+
+
+def _ptp_identity(label: str, b: bytes) -> str:
+    """Render an 8-byte PTP clockIdentity / grandmasterIdentity as text.
+
+    A MAC-derived EUI-64 (middle bytes ``ff:fe`` or ``ff:ff``) is reconstructed
+    to its 6-byte MAC in standard colon-hex (``clockid mac=aa:bb:cc:dd:ee:ff
+    eui64``) so the MAC detector aliases it to the SAME ``<MAC_n>`` as the device
+    L2 MAC (AUD-3 leak fix, design decision #9). A non-MAC-derived identity is
+    emitted as canonical 8-group colon-hex (``clockid aa:bb:cc:11:22:dd:ee:ff``),
+    which the built-in ptp_clockid detector tokenises. Never emits raw hex."""
+    if len(b) >= 8 and bytes(b[3:5]) in (b"\xff\xfe", b"\xff\xff"):
+        mac = bytes(b[0:3]) + bytes(b[5:8])
+        return f"{label} mac={_mac(mac)} eui64"
+    return f"{label} {_mac(b[:8])}"
+
+
+def _dissect_ptp(payload: bytes, sink: _Sink) -> None:
+    """Dissect a PTP message (UDP 319/320 or ethertype 0x88F7).
+
+    Distinguishes PTPv2 (2008; version nibble in byte 1 == 2) from PTPv1 (2002,
+    Dante; the ``versionPTP`` u16 at offset 0 == 1). A short / malformed payload
+    degrades to printable-string extraction, never an error, and NEVER raises out
+    of here — a bad PTP packet is not a corrupt file. ``ExtractError`` (the sink
+    budget guard) still propagates so the runaway-dissection cap is honoured."""
+    try:
+        if len(payload) >= 2 and (payload[1] & 0x0F) == 2:
+            _dissect_ptp_v2(payload, sink)
+        elif len(payload) >= 2 and int.from_bytes(payload[0:2], "big") == 1:
+            _dissect_ptp_v1(payload, sink)
+        else:
+            _emit_strings(payload, sink)
+    except ExtractError:
+        raise
+    except Exception:      # noqa: BLE001 - best-effort, fall back to strings
+        _emit_strings(payload, sink)
+
+
+def _dissect_ptp_v2(payload: bytes, sink: _Sink) -> None:
+    if len(payload) < 34:      # shorter than the fixed 34-byte PTPv2 header
+        _emit_strings(payload, sink)
+        return
+    msg_type = payload[0] & 0x0F
+    typename = _PTP_V2_TYPES.get(msg_type, f"type{msg_type}")
+    domain = payload[4]
+    clock_identity = payload[20:28]
+    port_number = int.from_bytes(payload[28:30], "big")
+    seq = int.from_bytes(payload[30:32], "big")
+
+    parts = [
+        f"ptp v2 {typename} dom={domain} seq={seq}",
+        _ptp_identity("clockid", clock_identity),
+        f"port={port_number}",
+    ]
+
+    if msg_type == 0xB and len(payload) >= 64:      # Announce body (offsets @34)
+        utc_off = int.from_bytes(payload[44:46], "big", signed=True)
+        gm_prio1 = payload[47]
+        gm_prio2 = payload[52]
+        gm_identity = payload[53:61]
+        steps_removed = int.from_bytes(payload[61:63], "big")
+        time_source = payload[63]
+        parts += [
+            f"prio1={gm_prio1}",
+            f"prio2={gm_prio2}",
+            _ptp_identity("gm", gm_identity),
+            f"steps={steps_removed}",
+            f"tsrc=0x{time_source:02x}",
+            f"utcoff={utc_off}",
+        ]
+    elif msg_type in _PTP_V2_TS_TYPES and len(payload) >= 44:
+        # originTimestamp: 6-byte seconds (u48) + 4-byte nanoseconds, big-endian.
+        # Surfaced verbatim — timestamps are a correlation key, never scrubbed.
+        secs = int.from_bytes(payload[34:40], "big")
+        nanos = int.from_bytes(payload[40:44], "big")
+        parts.append(f"origin_ts={secs}.{nanos:09d}")
+
+    sink.add(" ".join(parts))
+
+
+def _dissect_ptp_v1(payload: bytes, sink: _Sink) -> None:
+    if len(payload) < 34:      # shorter than the PTPv1 header through controlField
+        _emit_strings(payload, sink)
+        return
+    control = payload[32]
+    kind = _PTP_V1_CONTROL.get(control, f"control{control}")
+    source_uuid = payload[22:28]           # sourceUuid IS a MAC -> emit as one
+    seq = int.from_bytes(payload[30:32], "big")
+    # subdomain @4 is a 16-byte ASCII name (e.g. "_DFLT"), null-padded: keep only
+    # its printable characters (never emit raw bytes).
+    subdomain = "".join(chr(c) for c in payload[4:20] if 0x20 <= c <= 0x7E)
+    sink.add(
+        f"ptp v1 {kind} uuid mac={_mac(source_uuid)} seq={seq} dom={subdomain}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # L4 dissection
 
 
@@ -384,6 +508,8 @@ def _dissect_udp(data: bytes, sink: _Sink) -> None:
     payload = data[8:]
     if sport == 53 or dport == 53:
         _dissect_dns(payload, sink, tcp=False)
+    elif sport in (319, 320) or dport in (319, 320):
+        _dissect_ptp(payload, sink)
     else:
         _emit_strings(payload, sink)
 
@@ -472,6 +598,8 @@ def _dissect_l3(ethertype: int, payload: bytes, sink: _Sink) -> None:
         _dissect_ipv6(payload, sink)
     elif ethertype == _ET_ARP:
         _dissect_arp(payload, sink)
+    elif ethertype == _ET_PTP:
+        _dissect_ptp(payload, sink)
     else:
         sink.add(f"l3 ethertype=0x{ethertype:04x} len={len(payload)}")
         _emit_strings(payload, sink)
