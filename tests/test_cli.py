@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from piiscrub.cli import main
 
 
@@ -130,3 +132,28 @@ def test_none_leaves_defaults():
     cfg = _merge_cli_into_config(Config(), _ns())  # both None
     assert cfg.max_bytes == default.max_bytes
     assert cfg.stream_threshold == default.stream_threshold
+
+
+def test_unknown_extract_disable_name_rejected():
+    # A typo like "pacp" (or the wrong handler name "sqlite3") must fail fast:
+    # silently ignoring it would leave extraction ON and drop the source
+    # binaries the operator meant to preserve.
+    for bad in ("pacp", "sqlite3"):
+        with pytest.raises(SystemExit) as ei:
+            _merge_cli_into_config(Config(), _ns(extract_disable=[bad]))
+        assert "unknown extractor" in str(ei.value.code) and bad in str(ei.value.code)
+
+
+def test_known_extract_disable_name_accepted():
+    cfg = _merge_cli_into_config(Config(), _ns(extract_disable=["pcap", "archive"]))
+    assert cfg.extract.disable == {"pcap", "archive"}
+
+
+def test_unknown_extract_disable_from_config_table_rejected():
+    # The same validation must cover names coming from the [extract] TOML table,
+    # not only the CLI flag.
+    cfg = Config()
+    cfg.extract.disable = {"office", "bogus"}
+    with pytest.raises(SystemExit) as ei:
+        _merge_cli_into_config(cfg, _ns())
+    assert "bogus" in str(ei.value.code)

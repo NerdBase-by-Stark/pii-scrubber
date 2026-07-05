@@ -41,12 +41,20 @@ def build_summary(
         "files_total": stats.files_total,
         "files_processed": stats.files_processed,
         "files_copied_unprocessed": stats.files_copied,
+        "files_extracted": stats.files_extracted,
         "total_replacements": stats.replacements,
         "unique_values": len(amap.decode_table()),
         "entities": entities,
         "run_digest_sha256": run_digest,
         "by_category": dict(sorted(by_category.items())),
         "skipped": [{"file": s.rel, "status": s.status} for s in stats.skipped],
+        "extracted": [
+            {"file": e.rel, "output_file": e.out_rel, "kind": e.kind,
+             "replacements": e.replacements,
+             "members_processed": e.members_processed,
+             "members_copied": e.members_copied}
+            for e in stats.extracted
+        ],
         "warnings": stats.warnings,
         "verify": verify_status,
     }
@@ -74,6 +82,16 @@ def write_html(summary: dict, path: Path) -> None:
         f"<tr><td>{_h(s['file'])}</td><td>{_h(s['status'])}</td></tr>"
         for s in summary["skipped"]
     ) or "<tr><td colspan=2>None.</td></tr>"
+
+    extracted = summary.get("extracted", [])
+    extract_rows = "".join(
+        f"<tr><td><code>{_h(e['file'])}</code></td>"
+        f"<td><code>{_h(e['output_file'])}</code></td>"
+        f"<td>{_h(e['kind'])}</td><td class=n>{_h(e['replacements'])}</td>"
+        f"<td class=n>{_h(e['members_processed'])}</td>"
+        f"<td class=n>{_h(e['members_copied'])}</td></tr>"
+        for e in extracted
+    ) or "<tr><td colspan=6>None.</td></tr>"
 
     warn_items = "".join(f"<li>{_h(w)}</li>" for w in summary["warnings"]) \
         or "<li>None.</li>"
@@ -108,6 +126,7 @@ def write_html(summary: dict, path: Path) -> None:
  <tr><td>Files total</td><td>{_h(summary['files_total'])}</td></tr>
  <tr><td>Files processed</td><td>{_h(summary['files_processed'])}</td></tr>
  <tr><td>Copied unprocessed</td><td>{_h(summary['files_copied_unprocessed'])}</td></tr>
+ <tr><td>Extracted (scrubbed derivatives)</td><td>{_h(summary.get('files_extracted', 0))}</td></tr>
  <tr><td>Total replacements</td><td>{_h(summary['total_replacements'])}</td></tr>
  <tr><td>Unique values</td><td>{_h(summary['unique_values'])}</td></tr>
  <tr><td>Entities</td><td>{_h(summary.get('entities', 0))}</td></tr>
@@ -116,6 +135,9 @@ def write_html(summary: dict, path: Path) -> None:
 <h2>By category</h2>
 <table><tr><th>Category</th><th>Unique values</th><th>Occurrences</th></tr>
 {cat_rows}</table>
+<h2>Extracted (binary formats scrubbed into derivatives)</h2>
+<table><tr><th>Source</th><th>Output</th><th>Kind</th><th>Replacements</th>
+<th>Members scrubbed</th><th>Members copied</th></tr>{extract_rows}</table>
 <h2>Files copied unprocessed (may contain PII)</h2>
 <table><tr><th>File</th><th>Reason</th></tr>{skip_rows}</table>
 <h2>Warnings</h2><ul>{warn_items}</ul>

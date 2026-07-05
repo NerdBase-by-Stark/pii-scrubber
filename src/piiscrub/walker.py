@@ -17,15 +17,21 @@ from __future__ import annotations
 
 import codecs
 import fnmatch
+import os
 import shutil
+import tempfile
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from .engine import AliasMap, tokenize, tokenize_segment
 from .detectors import Detector
+from .formats import ExtractError, ExtractLimits, get_handler
 from .progress import ProgressCallback, ProgressEvent
+
+if TYPE_CHECKING:      # runtime-decoupled: only a duck-typed .enabled/.disable/.limits
+    from .config import ExtractConfig
 
 # Streaming controls (see process_tree).
 READ_BLOCK = 8 * 1024 * 1024   # raw bytes pulled per read for huge files
@@ -96,9 +102,25 @@ def _capture_export_hint(suffix: str) -> str:
 @dataclass
 class FileStat:
     rel: str
-    status: str           # "processed" | "binary" | "undecodable" | "oversize"
+    status: str           # "processed" | "extracted" | "binary" | "undecodable" | "oversize"
     encoding: str = ""
     replacements: int = 0
+    # For status == "extracted": the DST-relative path of the derivative /
+    # repacked output (differs from ``rel`` for derivatives, equals it for
+    # repacks). Empty ⇒ output shares ``rel`` (all non-extracted files).
+    out_rel: str = ""
+
+
+@dataclass
+class ExtractRecord:
+    """One source file a format handler turned into scrubbed output. Feeds the
+    report's "extracted" section — aliases/counts only, never raw PII."""
+    rel: str                    # source path (DST-relative)
+    out_rel: str                # derivative / repacked output path (DST-relative)
+    kind: str                   # "derivative" | "repack"
+    replacements: int
+    members_processed: int = 0  # archives: members scrubbed as text/nested
+    members_copied: int = 0     # archives: binary members copied in + flagged
 
 
 @dataclass
@@ -106,9 +128,11 @@ class RunStats:
     files_total: int = 0
     files_processed: int = 0
     files_copied: int = 0       # binary / undecodable / oversize passthrough
+    files_extracted: int = 0    # binary formats turned into scrubbed derivatives
     replacements: int = 0
     per_file: list[FileStat] = field(default_factory=list)
     skipped: list[FileStat] = field(default_factory=list)
+    extracted: list[ExtractRecord] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
 
@@ -320,6 +344,7 @@ def process_tree(
     stream_threshold: int = 50 * 1024 * 1024,
     progress: ProgressCallback | None = None,
     post_pass: Callable[[str, str], tuple[str, int]] | None = None,
+    extract: "ExtractConfig | None" = None,
 ) -> RunStats:
     """Walk ``src``; tokenise text files into ``dst`` (when ``write``).
 
@@ -379,6 +404,62 @@ def process_tree(
             out_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(path, out_path)
 
+    # Extraction settings (format handlers). Default = ON with default limits and
+    # nothing disabled, matching the CLI default. ``extract`` is duck-typed
+    # (.enabled/.disable/.limits) so the walker stays decoupled from config.
+    if extract is None:
+        extract_enabled = True
+        extract_disable: frozenset[str] = frozenset()
+        extract_limits = ExtractLimits()
+    else:
+        extract_enabled = extract.enabled
+        extract_disable = frozenset(extract.disable)
+        extract_limits = extract.limits
+    # Handlers receive the disable set folded into their limits so an archive
+    # applies the SAME per-format disable contract to its members that the walker
+    # applies to top-level files (findings: disable ignored for archive members).
+    handler_limits = replace(extract_limits, disable=extract_disable)
+
+    # Output-namespace bookkeeping so a format derivative (``x.pcap`` ->
+    # ``x.pcap.txt``) can never silently clobber, or be clobbered by, a real
+    # sibling source file that already lives at that exact name (e.g. a plain
+    # ``x.pcap.txt`` created by the old export-to-text hint). ``reserved_rels`` is
+    # every source rel (any of which may be written at its own path);
+    # ``claimed_out_rels`` accrues derivative outputs. We resolve the derivative's
+    # unique name here and MOVE the handler's staged output onto it (see the
+    # extraction block); the handler never writes into DST directly, so ordering
+    # between a producer and its colliding sibling no longer matters — critically,
+    # on a case-INSENSITIVE filesystem (macOS/APFS, Windows/NTFS) where writing
+    # ``x.pcap.txt`` would truncate an already-written ``X.PCAP.TXT`` sibling, the
+    # move targets only the collision-resolved name and never the sibling.
+    reserved_rels = {rel for _p, rel, _s in candidates}
+    claimed_out_rels: set[str] = set()
+
+    def _unique_out_rel(desired: str) -> str:
+        # Compare case-INSENSITIVELY: on case-insensitive filesystems (Windows/
+        # NTFS, macOS/APFS — the tool's primary pcap/evtx target platform)
+        # ``X.PCAP.txt`` and a plain sibling ``x.pcap.txt`` are the SAME file, so
+        # an exact-string check would let a derivative silently clobber (or be
+        # clobbered by) that sibling and misattribute the manifest. Fold case for
+        # the collision test but keep ``desired``'s original case for the output
+        # name. On case-sensitive filesystems this is merely conservative (it may
+        # relocate a derivative that would not truly collide) — safe either way.
+        taken = {r.casefold() for r in reserved_rels}
+        taken |= {r.casefold() for r in claimed_out_rels}
+        if desired.casefold() not in taken:
+            return desired
+        i = 1
+        while f"{desired}.dup{i}".casefold() in taken:
+            i += 1
+        return f"{desired}.dup{i}"
+
+    def _scrub(chunk_rel: str, text: str) -> tuple[str, int]:
+        """The closure handed to every format handler: run the run's detectors/
+        amap/allowlist over ``text`` and return (scrubbed_text, count). Handlers
+        never import the engine or touch the AliasMap directly."""
+        new_text, reps = tokenize(text, detectors, amap, allowlist_cf, file=chunk_rel)
+        return new_text, len(reps)
+
     for path, rel, size in candidates:
         stats.files_total += 1
         out_path = (dst / rel) if dst is not None else None
@@ -386,6 +467,110 @@ def process_tree(
         if size > max_bytes:
             _copy_through(rel, "oversize",
                           f"{rel}: {size} bytes > max ({max_bytes}); copied unprocessed")
+            files_done += 1
+            bytes_done_total += size
+            _emit(rel)
+            continue
+
+        # Format extraction: turn a supported binary (pcap/archive/office/
+        # sqlite) into scrubbed text/repacked output, BEFORE the plain
+        # copy-through. On ExtractError (corrupt/encrypted/guard tripped) fall
+        # back to the exact old behaviour: copy the original through + flag.
+        # The handler is responsible for deleting any partial derivative before
+        # raising, so the fallback never leaves a half-written output behind.
+        handler = get_handler(path.suffix) if extract_enabled else None
+        if handler is not None and handler.name not in extract_disable:
+            # STAGE the handler's output in a private temp dir under DST rather
+            # than letting it write ``dst/rel`` (+suffix) directly. A derivative's
+            # collision-resolved name is only known AFTER the handler reports its
+            # ``out_rel``; if the handler wrote the natural name first, then on a
+            # case-INSENSITIVE filesystem it would already have truncated a
+            # case-differing sibling (e.g. a plain ``X.PCAP.TXT``) that sorted
+            # first — the post-write relocation cannot undo that. Staging lets us
+            # place the single produced file onto the resolved-unique path ourselves
+            # (an atomic same-filesystem rename), never touching the sibling.
+            stage_dir: Path | None = None
+            if write and dst is not None:
+                dst.mkdir(parents=True, exist_ok=True)
+                stage_dir = Path(tempfile.mkdtemp(
+                    dir=str(dst), prefix=".piiscrub-stage-"))
+            stage_out_path = (stage_dir / Path(rel).name) if stage_dir else None
+            placement_error: OSError | None = None
+            try:
+                try:
+                    outcome = handler.process(path, rel, stage_out_path, _scrub,
+                                              write=write, limits=handler_limits)
+                except ExtractError as e:
+                    _copy_through(
+                        rel, "binary",
+                        f"{rel}: binary type, copied unprocessed (may contain PII)"
+                        + _capture_export_hint(path.suffix)
+                        + f" — extraction skipped: {e}",
+                    )
+                    files_done += 1
+                    bytes_done_total += size
+                    _emit(rel)
+                    continue
+
+                # Resolve the final output name. A derivative whose name collides
+                # (case-insensitively) with a real source file or an earlier
+                # derivative is uniquified so neither file is lost and the manifest
+                # attributes each output to the right source. A repack keeps its
+                # own rel (equal to a source path, so it cannot collide).
+                out_rel = outcome.out_rel
+                if outcome.kind == "derivative":
+                    out_rel = _unique_out_rel(outcome.out_rel)
+                    if out_rel != outcome.out_rel:
+                        stats.warnings.append(
+                            f"{rel}: derivative {outcome.out_rel!r} collides with "
+                            f"an existing file; written as {out_rel!r} instead")
+
+                # Move the handler's single staged output onto the resolved path.
+                if stage_dir is not None and dst is not None:
+                    produced = sorted(
+                        p for p in stage_dir.rglob("*") if p.is_file())
+                    if produced:
+                        final = dst / out_rel
+                        try:
+                            final.parent.mkdir(parents=True, exist_ok=True)
+                            os.replace(produced[0], final)
+                        except OSError as e:
+                            # e.g. ENAMETOOLONG on the resolved output name: fail
+                            # OPEN to copy-through + flag (the staged file is
+                            # discarded with the stage dir in ``finally``).
+                            placement_error = e
+                if placement_error is None and outcome.kind == "derivative":
+                    claimed_out_rels.add(out_rel)
+            finally:
+                if stage_dir is not None:
+                    shutil.rmtree(stage_dir, ignore_errors=True)
+
+            if placement_error is not None:
+                _copy_through(
+                    rel, "binary",
+                    f"{rel}: binary type, copied unprocessed (may contain PII)"
+                    + _capture_export_hint(path.suffix)
+                    + f" — extraction skipped: could not place output: "
+                    f"{placement_error}",
+                )
+                files_done += 1
+                bytes_done_total += size
+                _emit(rel)
+                continue
+
+            stats.extracted.append(ExtractRecord(
+                rel=rel, out_rel=out_rel, kind=outcome.kind,
+                replacements=outcome.replacements,
+                members_processed=outcome.members_processed,
+                members_copied=outcome.members_copied,
+            ))
+            stats.per_file.append(FileStat(
+                rel, "extracted", replacements=outcome.replacements,
+                out_rel=out_rel))
+            stats.files_extracted += 1
+            stats.replacements += outcome.replacements
+            for w in outcome.warnings:
+                stats.warnings.append(f"{rel}: {w}")
             files_done += 1
             bytes_done_total += size
             _emit(rel)

@@ -48,8 +48,13 @@ small and low-AV-risk.
 - **Optional LLM second pass** — off by default; flags residual PII the regex missed,
   reading only the **already-stripped** text. Local model by default, cloud endpoints
   hard-gated, API key by env-var only. See below.
-- **Robust file handling** — encoding/BOM detection, binary passthrough, adaptive
-  streaming for multi-GB files (output byte-identical to whole-file), progress bar.
+- **Format extraction (ON by default)** — `.pcap`/`.pcapng`/`.cap`, `.zip`/`.tar[.gz|.bz2|.xz]`/`.tgz`/`.gz`/`.bz2`/`.xz`,
+  `.docx`/`.xlsx`/`.pptx`, and `.db`/`.sqlite`/`.sqlite3` are dissected or repacked
+  into scrubbed derivatives instead of copied through raw; `--no-extract` restores
+  plain copy-through, `--extract-disable NAME` opts out one format at a time.
+- **Robust file handling** — encoding/BOM detection, adaptive streaming for
+  multi-GB files (output byte-identical to whole-file), progress bar; binary
+  formats with no extractor are still copied through and flagged.
 - **CLI *and* GUI** — a stdlib-only CLI plus an optional PySide6 folder-picker GUI;
   both ship as portable Windows `.exe`s built in CI.
 
@@ -86,7 +91,7 @@ PYTHONPATH=src python -m piiscrub scan ./logs
 |---------|--------------|
 | `scan SRC` | **Dry-run.** Detects PII and writes a preview report to `SRC/_pii/scan_report.{html,json}`. Writes **no** stripped files and **no** decode map. |
 | `strip SRC DST` | Writes a stripped mirror into `DST`; writes the decode map + report + chain-of-custody manifest into `SRC/_pii/` (or the project vault); then **auto-runs verify**. |
-| `verify DST` | Re-scans a stripped tree for residual PII shapes and stray sidecars. **Fail-closed** — exits `10` on any finding. |
+| `verify DST` | Re-scans a stripped tree for residual PII shapes and stray sidecars, recursing into repacked archives when extraction is on. **Fail-closed** — exits `10` on any finding. |
 | `reverse IN OUT --map M` | Rehydrates aliases in `IN` back to originals using a decode map, writing `OUT`. |
 | `reconcile IN OUT --project P` | Rewrites an already-stripped tree to current canonical aliases (e.g. `<IP_1>` → `<DEV0001.IP_1>`) and writes a **new** output tree. Custody-safe: the input is never modified. |
 | `--selftest` | Compiles every detector and runs a tiny tokenise → reverse → re-scan round-trip; exits `0` on success. CI uses this to prove a frozen `.exe` actually runs. |
@@ -189,6 +194,7 @@ the config:
 --enable D          --disable D         (repeatable detector toggles)
 --include GLOB      --exclude GLOB      (repeatable globs)
 --max-bytes N       --stream-threshold N
+--no-extract        --extract-disable NAME   (repeatable; format extraction toggles)
 ```
 
 ---
@@ -332,10 +338,47 @@ is stored under `runs/<timestamp>/`.
 * **Encoding:** BOM detection (UTF-8 / UTF-16 / UTF-32) → else strict UTF-8 →
   else cp1252. Output is re-encoded in the detected encoding (UTF-16/32 keep
   their BOM).
-* **Binary / undecodable files** (a NUL byte in the first 4 KB, or a known
-  binary extension such as `.pcap .evtx .xlsx .docx .zip .png`) are **copied
-  through unchanged and flagged** in the report as "may contain PII" — never
-  silently half-stripped.
+* **Format extraction (ON by default).** Supported binary formats are
+  **dissected/repacked into scrubbed output** rather than copied through raw:
+  * `.pcap` / `.pcapng` / `.cap` → a scrubbed text dissection `capture.pcap.txt`
+    (per-packet fields + printable payload strings, all tokenised);
+  * `.docx` / `.pptx` → `report.docx.txt`, `.xlsx` → `book.xlsx.csv` (visible
+    text / cells / slide notes / author core-props);
+  * `.db` / `.sqlite` / `.sqlite3` → `data.db.txt` (every user table dumped
+    CSV-ish, read-only open, BLOBs shown as `<blob N bytes>`, never hex);
+  * `.zip` / `.tar[.gz|.bz2|.xz]` / `.tgz` / single-file `.gz` `.bz2` `.xz` →
+    **repacked in the same format** with every member scrubbed by this same
+    decision tree (text tokenised; supported binary member dissected; unknown
+    binary member copied in + flagged).
+
+  The **original binary is not copied into the output** when a derivative is
+  produced (it would carry the very PII we scrubbed); the report's `extracted`
+  section records the `src → out` mapping. Anything that cannot be fully and
+  safely read (corrupt/encrypted/oversized/too-deeply-nested) **fails open**:
+  the original is copied through unchanged and flagged "may contain PII", exactly
+  like the pre-extraction behaviour.
+* **Turning extraction off / partially off.**
+  * `--no-extract` restores the old behaviour: every binary is copied through
+    unchanged and flagged (on `verify` it also skips archive recursion — a
+    documented weaker guarantee).
+  * `--extract-disable NAME` (repeatable) disables one extractor by name
+    (`pcap` | `archive` | `office` | `sqlite`); its files — **including members
+    inside archives** — are copied through unchanged + flagged instead of
+    dissected. An unknown name is rejected fast rather than silently ignored.
+  * The `[extract]` TOML table sets the same options plus the guard rails
+    (`disable`, `max_out_bytes`, `max_depth`, `max_members`); see
+    [`docs/USAGE.md`](docs/USAGE.md).
+* **Still export-to-text first** for formats with **no** built-in extractor —
+  `.evtx` / `.etl` (`wevtutil qe … /f:text`) and `.pdf`: these are copied
+  through + flagged with the export hint, then re-run on the exported text.
+* **Reversing a repacked archive.** A derivative `.txt`/`.csv` reverses directly
+  with `piiscrub reverse` (it is text + aliases). For a repacked `.zip`/`.tar`,
+  unzip it and run `reverse` on each extracted text member with the same decode
+  map / vault.
+* **Binary / undecodable files** with no extractor (a NUL byte in the first
+  4 KB, or a binary extension such as `.png` `.exe` `.pdf`, or a
+  `--no-extract`/disabled format) are **copied through unchanged and flagged** in
+  the report as "may contain PII" — never silently half-stripped.
 * **Adaptive streaming for huge files.** Files at or below `stream_threshold`
   (default 50 MB) are processed whole, which preserves multi-line token
   detection (e.g. PEM private-key blocks). Larger files are processed in
@@ -350,9 +393,8 @@ is stored under `runs/<timestamp>/`.
   pollutes the JSON on stdout) and auto-disables when stderr is not a TTY. Use
   `--no-progress` to silence it.
 
-Format extractors for archives/structured binaries (evtx/xlsx/zip) remain on the
-backlog — see
-[`docs/plans/2026-06-18-pii-scrubber-design.md`](docs/plans/2026-06-18-pii-scrubber-design.md).
+`.evtx` binary-XML parsing (and `.pdf` / `.msg`) remain out of scope — see
+[`docs/plans/2026-07-05-format-extractors-design.md`](docs/plans/2026-07-05-format-extractors-design.md).
 
 ---
 

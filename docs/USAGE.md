@@ -281,6 +281,147 @@ piiscrub reverse ./out-syslog-v2/app.log ./app.restored.log \
 
 ---
 
+## Format extraction (binary formats — ON by default)
+
+By default `scan`/`strip` **dissect or repack** supported binary formats into
+scrubbed output instead of copying the raw binary (which would carry PII) into
+the shareable tree:
+
+| Source | Output | Notes |
+|--------|--------|-------|
+| `capture.pcap` / `.pcapng` / `.cap` | `capture.pcap.txt` | per-packet dissection + printable payload strings, all tokenised |
+| `report.docx`, `deck.pptx` | `…​.txt` | paragraph / slide / notes text + author core-props |
+| `book.xlsx` | `book.xlsx.csv` | one CSV line per row, `# sheet:` sections |
+| `data.db` / `.sqlite` / `.sqlite3` | `data.db.txt` | every user table dumped read-only; BLOBs as `<blob N bytes>` |
+| `logs.zip`, `logs.tar.gz`, `f.gz` … | same name, repacked | each member scrubbed by the same rules (recursively) |
+
+The **original binary is not copied** when a derivative is produced; the report's
+`extracted` section records the `src → out` mapping and member counts. Anything
+that cannot be fully/safely read — corrupt, encrypted/password-protected, a
+tripped size/depth/member guard — **fails open**: the original is copied through
+unchanged and flagged "may contain PII" (the pre-extraction behaviour).
+
+Formats with **no** built-in extractor are still copied through + flagged with
+an export-to-text hint. For `.evtx` / `.etl`, export on a Windows host first
+(`wevtutil qe FILE /lf:true /f:text > out.txt`) then re-run on the text. For
+`.pdf`, extract the text with any PDF-to-text tool (e.g. `pdftotext`) and re-run
+on that output.
+
+### Turning it off
+
+```bash
+# restore the old copy-through + flag for every binary (verify also skips
+# archive recursion — a documented weaker guarantee):
+piiscrub strip ./src ./out --no-extract
+
+# keep original .pcap captures intact for a downstream tool, but still scrub
+# everything else (repeatable; also honored for members INSIDE archives):
+piiscrub strip ./src ./out --extract-disable pcap
+```
+
+An unknown extractor name (a typo like `pacp`, or `sqlite3` instead of `sqlite`)
+is rejected immediately rather than silently leaving extraction on. Valid names:
+`pcap`, `archive`, `office`, `sqlite`.
+
+Equivalent `piiscrub.toml`:
+
+```toml
+[extract]
+enabled = true                 # false == --no-extract
+disable = ["pcap"]             # per-format opt-out (names above)
+max_out_bytes = 536870912      # 512 MB cap on expanded text per source file
+max_depth = 3                  # nested-archive recursion cap
+max_members = 50000            # member / row cap
+```
+
+### Worked example — a folder with a pcap and a zip
+
+Say `./evidence` contains a packet capture and an archive of logs, alongside
+plain text:
+
+```
+evidence/
+├── capture.pcap      # a TCP flow with an HTTP request (email + URL in the payload)
+└── logs.zip          # contains app.log (an IP + email) and a screenshot.png
+```
+
+```bash
+piiscrub strip ./evidence ./evidence-clean
+```
+
+Sample stdout (same shape as any other `strip`):
+
+```json
+{
+  "mode": "strip",
+  "files_processed": 2,
+  "files_copied_unprocessed": 0,
+  "replacements": 6,
+  "entities": 0,
+  "decode_map": "/.../evidence/_pii/decode.json",
+  "report": "/.../evidence/_pii/report.html",
+  "manifest": "/.../evidence/_pii/manifest.json",
+  "run_digest": "7c1e4a9b...",
+  "verify": "PASS"
+}
+```
+
+Resulting layout — note `capture.pcap` becomes a `.txt` derivative and
+`logs.zip` is repacked under its **original name** (the raw `.pcap` is never
+copied into the shareable tree):
+
+```
+evidence-clean/
+├── capture.pcap.txt   # scrubbed dissection, see below
+└── logs.zip           # repacked: app.log scrubbed, screenshot.png copied + flagged
+```
+
+`capture.pcap.txt` (excerpt — every address/name/string tokenised, no raw hex):
+
+```
+# packet 1 ts=2026-07-05T09:12:04.000000Z caplen=74 origlen=74
+eth <MAC_1> -> <MAC_2> type=0x0800
+ipv4 <IP_1> -> <IP_2> proto=6 ttl=64
+tcp 51000 -> 80 flags=PA len=34
+payload "GET /x?u=<EMAIL_1> HTTP/1.1"
+payload "<URL_1>"
+```
+
+`logs.zip`'s `app.log` member is scrubbed the same way any top-level text file
+would be (`10.0.0.5 alice@example.com` → `<IP_1> <EMAIL_1>`); `screenshot.png`
+has no extractor, so it is copied into the repacked zip unchanged and the
+report flags it "may contain PII", same as a top-level binary would be.
+
+The report's `extracted` section (aliases/counts only, never raw values)
+records both:
+
+```json
+"extracted": [
+  {"file": "capture.pcap", "output_file": "capture.pcap.txt",
+   "kind": "derivative", "replacements": 4,
+   "members_processed": 0, "members_copied": 0},
+  {"file": "logs.zip", "output_file": "logs.zip",
+   "kind": "repack", "replacements": 2,
+   "members_processed": 1, "members_copied": 1}
+]
+```
+
+To reverse: `capture.pcap.txt` is plain text, so `piiscrub reverse` works on it
+directly; for `logs.zip`, unzip the repacked archive and run `reverse` on the
+extracted `app.log` with the same decode map.
+
+### Reversing extracted output
+
+A `.txt` / `.csv` derivative is plain text + aliases, so `piiscrub reverse`
+rehydrates it directly against the decode map / vault. For a **repacked
+archive** (`.zip`, `.tar`, `.tar.gz`/`.tgz`, `.tar.bz2`, `.tar.xz`), extract it
+first (decompressing as needed), then run `reverse` on each extracted text
+member with the same map — the members are ordinary scrubbed text. A repacked
+**single-file** `.gz`/`.bz2`/`.xz` is decompressed the same way (`gunzip`,
+`bunzip2`, `unxz`) before reversing the inner text file.
+
+---
+
 ## Verifying an existing stripped tree
 
 You can re-run the fail-closed residual-PII check on any stripped tree at any
@@ -291,7 +432,11 @@ piiscrub verify ./acme-clean
 ```
 
 It exits `0` when the tree is clean, or `10` and prints the findings (residual
-PII and any stray decode/report sidecars) when it is not.
+PII and any stray decode/report sidecars) when it is not. With extraction on
+(the default) it **recurses into repacked archives** and scans their text
+members too, reporting any leak with `archive.zip!member/path` notation; a scan
+stopped early by a size/member cap is itself reported so a partially-scanned
+archive never passes as clean. `--no-extract` skips that recursion.
 
 ---
 
@@ -340,5 +485,7 @@ Release as the CLI exe on tag pushes.
 | `--include GLOB` / `--exclude GLOB` | scan, strip, verify | Filter files (repeatable). |
 | `--max-bytes N` | scan, strip, verify | Copy files larger than `N` bytes through unprocessed. |
 | `--stream-threshold N` | scan, strip, verify | Stream files larger than `N` bytes (default 50 MB). |
+| `--no-extract` | scan, strip, verify | Disable binary-format extraction (pcap/archive/office/sqlite); restore copy-through + flag. On `verify`, also skips archive recursion. |
+| `--extract-disable NAME` | scan, strip, verify | Disable one extractor by name (`pcap`\|`archive`\|`office`\|`sqlite`); repeatable, also applied to archive members. |
 | `--no-progress` | scan, strip, verify | Suppress the stderr progress bar. |
 | `--map PATH` | reverse | Decode map (`decode.json`) or vault `map.json`. |

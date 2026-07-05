@@ -32,20 +32,26 @@ def _hash_or_blank(path: Path) -> str:
 
 def build_records(src: Path, dst: Path, stats: RunStats, timestamp: str) -> list[dict]:
     records: list[dict] = []
-    # processed text files
+    # processed text files (+ extracted derivatives / repacks)
     for fs in stats.per_file:
+        # For an extracted file the derivative/repack lives at ``out_rel`` (the
+        # original binary is NOT copied into DST), so hash the source original
+        # and the derivative output and record BOTH paths. All other statuses
+        # write the output at the same rel as the source.
+        out_rel = fs.out_rel or fs.rel
         records.append({
-            "file": fs.rel, "status": fs.status, "encoding": fs.encoding,
+            "file": fs.rel, "output_file": out_rel,
+            "status": fs.status, "encoding": fs.encoding,
             "replacements": fs.replacements,
             "source_sha256": _hash_or_blank(src / fs.rel),
-            "output_sha256": _hash_or_blank(dst / fs.rel),
+            "output_sha256": _hash_or_blank(dst / out_rel),
             "timestamp": timestamp,
         })
     # copied-through files (binary / undecodable / oversize)
     for fs in stats.skipped:
         records.append({
-            "file": fs.rel, "status": fs.status, "encoding": "",
-            "replacements": 0,
+            "file": fs.rel, "output_file": fs.rel, "status": fs.status,
+            "encoding": "", "replacements": 0,
             "source_sha256": _hash_or_blank(src / fs.rel),
             "output_sha256": _hash_or_blank(dst / fs.rel),
             "timestamp": timestamp,
