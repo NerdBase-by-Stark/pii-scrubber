@@ -15,8 +15,10 @@ be reused across runs (cross-run correlation).
 
 from __future__ import annotations
 
+import ipaddress
 import re
 from dataclasses import dataclass
+from typing import Callable
 
 from .detectors import Detector
 
@@ -49,6 +51,19 @@ class AliasMap:
         self._counters: dict[str, int] = {}       # counter name -> int
         self._entities: dict[str, dict] = {}      # entity_id -> {label,type,pretty,notes}
         self._entity_counters: dict[str, int] = {}  # entity prefix -> int
+        self._nets: dict[str, str] = {}           # net_key -> label "NET1","NET2"…
+
+    # ---- structured net labels -----------------------------------------
+    def net_label(self, net_key: str) -> str:
+        """Return the NET label for ``net_key`` (e.g. ``"v4:192.0.2.0"``),
+        minting ``NET1``, ``NET2``… in first-seen order on first use. Labels
+        share one sequence across address families — ``net_key`` disambiguates.
+        Persisted in the vault as ``nets`` so labels stay stable across runs."""
+        lbl = self._nets.get(net_key)
+        if lbl is None:
+            lbl = f"NET{len(self._nets) + 1}"
+            self._nets[net_key] = lbl
+        return lbl
 
     # ---- entity registration -------------------------------------------
     def register_entity(self, entity_id: str, entity_type: str = "device",
@@ -163,6 +178,7 @@ class AliasMap:
             "counters": self._counters,
             "entities": self._entities,
             "entity_counters": self._entity_counters,
+            "nets": self._nets,
         }
 
     @classmethod
@@ -175,7 +191,64 @@ class AliasMap:
         m._counters = dict(data.get("counters", {}))
         m._entities = {e: dict(v) for e, v in data.get("entities", {}).items()}
         m._entity_counters = dict(data.get("entity_counters", {}))
+        m._nets = dict(data.get("nets", {}))
         return m
+
+
+def make_structured_style(amap: AliasMap) -> Callable[[Detector, str], str]:
+    """Build a structure-preserving alias-prefix callable (design decision #3).
+
+    Returns ``style(detector, value) -> prefix``, suitable for the ``style``
+    argument of :func:`tokenize` / :func:`tokenize_segment`. It re-labels
+    IPv4/IPv6/MAC values so an LLM still sees network structure (subnet
+    grouping, multicast, link-local) while every other category keeps its
+    opaque ``det.prefix``:
+
+      * ipv4 → ``MCAST`` (multicast), ``IP_LL`` (169.254/16 link-local), else
+        ``IP_NET<n>`` grouped by /24.
+      * ipv6 → ``MCAST6`` (multicast), else ``IPV6_NET<n>`` grouped by /64.
+      * mac  → ``MACMC`` when the group (multicast) bit of the first octet is
+        set, else ``det.prefix``.
+
+    NET labels are minted on ``amap`` (shared v4/v6 first-seen sequence). Uses
+    :mod:`ipaddress` defensively — any parse failure falls back to
+    ``det.prefix`` so a malformed value never raises.
+    """
+
+    def style(det: Detector, value: str) -> str:
+        cat = det.category
+        if cat == "ipv4":
+            try:
+                ip = ipaddress.IPv4Address(value)
+            except ValueError:
+                return det.prefix
+            if ip.is_multicast:
+                return "MCAST"
+            if ip.is_link_local:  # 169.254.0.0/16
+                return "IP_LL"
+            net = ipaddress.ip_network(f"{value}/24", strict=False)
+            return f"IP_{amap.net_label('v4:' + str(net.network_address))}"
+        if cat == "ipv6":
+            try:
+                ip6 = ipaddress.IPv6Address(value)
+            except ValueError:
+                return det.prefix
+            if ip6.is_multicast:
+                return "MCAST6"
+            net6 = ipaddress.ip_network(f"{value}/64", strict=False)
+            return f"IPV6_{amap.net_label('v6:' + str(net6.network_address))}"
+        if cat == "mac":
+            first = re.split(r"[:-]", value, maxsplit=1)[0]
+            try:
+                octet = int(first, 16)
+            except ValueError:
+                return det.prefix
+            if octet & 1:  # group bit set => multicast MAC
+                return "MACMC"
+            return det.prefix
+        return det.prefix
+
+    return style
 
 
 def _overlaps(s: int, e: int, claimed: list[tuple[int, int]]) -> bool:
@@ -225,6 +298,8 @@ def tokenize(
     amap: AliasMap,
     allowlist_cf: frozenset[str] = frozenset(),
     file: str | None = None,
+    *,
+    style: Callable[[Detector, str], str] | None = None,
 ) -> tuple[str, list[Replacement]]:
     chosen = find_spans(text, detectors, allowlist_cf)
     parts: list[str] = []
@@ -232,7 +307,8 @@ def tokenize(
     last = 0
     for s, e, val, det in chosen:
         key = val.casefold() if det.casefold_key else val
-        alias = amap.alias_for(val, key, det.category, det.prefix, file, det.entity_id)
+        prefix = style(det, val) if (style is not None and det.entity_id is None) else det.prefix
+        alias = amap.alias_for(val, key, det.category, prefix, file, det.entity_id)
         parts.append(text[last:s])
         parts.append(alias)
         last = e
@@ -249,6 +325,7 @@ def tokenize_segment(
     file: str | None = None,
     *,
     safe_end: int | None = None,
+    style: Callable[[Detector, str], str] | None = None,
 ) -> tuple[str, list[Replacement], int]:
     """Tokenise ``text`` but only commit replacements whose span END is
     <= ``safe_end``; return ``(committed_text, reps, consumed)`` where
@@ -284,7 +361,8 @@ def tokenize_segment(
                 cut = s
             break
         key = val.casefold() if det.casefold_key else val
-        alias = amap.alias_for(val, key, det.category, det.prefix, file, det.entity_id)
+        prefix = style(det, val) if (style is not None and det.entity_id is None) else det.prefix
+        alias = amap.alias_for(val, key, det.category, prefix, file, det.entity_id)
         parts.append(text[last:s])
         parts.append(alias)
         last = e
