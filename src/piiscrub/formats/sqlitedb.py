@@ -31,6 +31,7 @@ import io
 import sqlite3
 from contextlib import closing
 from pathlib import Path
+from urllib.parse import quote
 
 from . import register
 from .base import ExtractError, ExtractLimits, ExtractOutcome, ScrubFn

@@ -726,6 +726,14 @@ class _PcapHandler:
         limits: ExtractLimits,
     ) -> ExtractOutcome:
         try:
+            # Size guard BEFORE reading the whole capture into RAM. A multi-GB
+            # pcap (routine in netops) would otherwise be slurped whole and
+            # MemoryError — which is NOT an ExtractError — would abort the entire
+            # run instead of falling back to copy-through. Cap the input read at
+            # max_out_bytes; a bigger capture fails open to copy+flag.
+            if path.stat().st_size > limits.max_out_bytes:
+                raise ExtractError(
+                    f"capture exceeds max_out_bytes ({limits.max_out_bytes})")
             data = path.read_bytes()
         except OSError as e:
             # Unreadable source: fail open to copy-through + flag.

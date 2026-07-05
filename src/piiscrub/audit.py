@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 from .detectors import Detector
 from .engine import AliasMap, reverse_text, tokenize
 from .formats import ExtractLimits, get_handler
-from .formats.archives import iter_text_members
+from .formats.archives import SCAN_TRUNCATED, iter_text_members
 from .walker import BINARY_EXTS, decode_bytes, iter_files
 
 if TYPE_CHECKING:      # duck-typed .enabled/.disable/.limits; avoids a config cycle
@@ -62,6 +62,15 @@ def verify_tree(
             if handler is not None and handler.name == "archive" \
                     and handler.name not in extract_disable:
                 for member_rel, text in iter_text_members(path, rel, extract_limits):
+                    if text is SCAN_TRUNCATED:
+                        # A cap (max_members/max_out_bytes) stopped the archive
+                        # scan early. Fail closed: record it as a finding so a
+                        # only-partially-scanned archive can never pass as clean.
+                        leaks.append({
+                            "file": member_rel,
+                            "category": "archive-scan-truncated", "line": 0,
+                        })
+                        continue
                     scratch = AliasMap()
                     _new, reps = tokenize(text, detectors, scratch, allowlist_cf)
                     for r in reps:

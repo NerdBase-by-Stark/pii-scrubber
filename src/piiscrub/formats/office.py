@@ -359,6 +359,17 @@ class _OfficeHandler:
 
         try:
             with zf:
+                # Decompression-bomb pre-check (mirrors archives.py): reject any
+                # part whose DECLARED uncompressed size already exceeds the budget
+                # before ``zf.read`` materialises it. The per-emit() byte guard
+                # only trips AFTER a part is fully decompressed into memory, so a
+                # tiny .docx whose document.xml expands to several GB would
+                # otherwise exhaust RAM before the first emit().
+                for info in zf.infolist():
+                    if info.file_size > budget:
+                        raise ExtractError(
+                            f"OOXML part {info.filename!r} declares "
+                            f"{info.file_size} bytes > max_out_bytes ({budget})")
                 for author in _author_lines(zf):
                     emit(author)
                 if suffix == ".docx":
@@ -371,6 +382,13 @@ class _OfficeHandler:
             # zipfile raises RuntimeError("File is encrypted ...") when reading an
             # encrypted member of an otherwise-openable container.
             raise ExtractError(f"encrypted OOXML member: {e}") from e
+        except (zipfile.BadZipFile, NotImplementedError, EOFError, OSError) as e:
+            # A member with a bad CRC / truncated data raises BadZipFile, and an
+            # unsupported compression method raises NotImplementedError, from
+            # ``zf.read`` INSIDE the body (central directory intact, member bytes
+            # corrupt). Convert to ExtractError so the walker falls back to
+            # copy-through + flag instead of aborting the whole run.
+            raise ExtractError(f"corrupt OOXML member: {e}") from e
 
         text = "\n".join(lines)
         if text:

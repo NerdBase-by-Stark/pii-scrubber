@@ -347,13 +347,20 @@ def _process_zip(path: Path, rel: str, out_path: Path | None,
             running += len(data)
 
             out_name, out_data, processed, copied, reps, warns = _handle_member(
-                name, data, rel, scrub, limits, write)
+                name, data, rel, scrub, limits, write,
+                limits.max_out_bytes - running)
             total_reps += reps
             mproc += int(processed)
             mcopied += int(copied)
             warnings.extend(warns)
+            unique = _unique_member_name(out_name, used_names)
+            if unique != out_name:
+                warnings.append(
+                    f"member {out_name!r}: name collides with another member; "
+                    f"stored as {unique!r}")
+            used_names.add(unique)
             if zout is not None:
-                zi = zipfile.ZipInfo(out_name, date_time=info.date_time)
+                zi = zipfile.ZipInfo(unique, date_time=info.date_time)
                 zi.compress_type = zipfile.ZIP_DEFLATED
                 zout.writestr(zi, out_data or b"")
 
@@ -385,10 +392,18 @@ def _process_tar(path: Path, rel: str, out_path: Path | None, scrub: ScrubFn,
     warnings: list[str] = []
     running = 0
     members_seen = 0
+    used_names: set[str] = set()
     tout = None
     tmp_path: str | None = None
     try:
-        members = tin.getmembers()
+        # A tar truncated/corrupted mid-archive raises tarfile.ReadError from
+        # getmembers() (or from a member read below); convert every such
+        # structural failure to ExtractError so the walker falls back to
+        # copy-through + flag instead of aborting the whole run with a traceback.
+        try:
+            members = tin.getmembers()
+        except (tarfile.TarError, EOFError, OSError, lzma.LZMAError) as e:
+            raise ExtractError(f"corrupt tar: {e}") from e
         if write and out_path is not None:
             out_path.parent.mkdir(parents=True, exist_ok=True)
             fd, tmp_path = tempfile.mkstemp(dir=str(out_path.parent), suffix=".part")
@@ -412,19 +427,29 @@ def _process_tar(path: Path, rel: str, out_path: Path | None, scrub: ScrubFn,
                 raise ExtractError(f"member count exceeds max_members ({limits.max_members})")
             if running + m.size > limits.max_out_bytes:
                 raise ExtractError(f"decompressed size exceeds max_out_bytes ({limits.max_out_bytes})")
-            src = tin.extractfile(m)
-            data = src.read() if src is not None else b""
+            try:
+                src = tin.extractfile(m)
+                data = src.read() if src is not None else b""
+            except (tarfile.TarError, EOFError, OSError, lzma.LZMAError) as e:
+                raise ExtractError(f"corrupt tar member {name!r}: {e}") from e
             running += len(data)
 
             out_name, out_data, processed, copied, reps, warns = _handle_member(
-                name, data, rel, scrub, limits, write)
+                name, data, rel, scrub, limits, write,
+                limits.max_out_bytes - running)
             total_reps += reps
             mproc += int(processed)
             mcopied += int(copied)
             warnings.extend(warns)
+            unique = _unique_member_name(out_name, used_names)
+            if unique != out_name:
+                warnings.append(
+                    f"member {out_name!r}: name collides with another member; "
+                    f"stored as {unique!r}")
+            used_names.add(unique)
             if tout is not None:
                 payload = out_data or b""
-                ti = tarfile.TarInfo(out_name)
+                ti = tarfile.TarInfo(unique)
                 ti.size = len(payload)
                 ti.mtime = m.mtime          # preserve member timestamp
                 ti.mode = m.mode
@@ -454,7 +479,17 @@ def _process_single(path: Path, rel: str, out_path: Path | None, scrub: ScrubFn,
                     write: bool, limits: ExtractLimits, comp: str) -> ExtractOutcome:
     from ..walker import BINARY_EXTS, decode_bytes  # deferred: avoids import cycle
 
-    raw = path.read_bytes()
+    # Size guard BEFORE reading: a multi-GB compressed file must not be slurped
+    # whole into RAM (a MemoryError is not an ExtractError, so the walker would
+    # abort the run instead of falling back to copy-through). Cap the raw read at
+    # max_out_bytes; a bigger source fails open to copy+flag.
+    try:
+        if path.stat().st_size > limits.max_out_bytes:
+            raise ExtractError(
+                f"compressed source exceeds max_out_bytes ({limits.max_out_bytes})")
+        raw = path.read_bytes()
+    except OSError as e:
+        raise ExtractError(f"cannot read compressed source: {e}") from e
     try:
         inner = _decompress_capped(raw, comp, limits.max_out_bytes)
     except (OSError, EOFError, lzma.LZMAError) as e:
@@ -463,12 +498,19 @@ def _process_single(path: Path, rel: str, out_path: Path | None, scrub: ScrubFn,
     inner_name = _strip_comp_suffix(path.name)
     inner_suffix = Path(inner_name).suffix.lower()
     handler = get_handler(inner_suffix)
+    # Honor the run's per-format disable set (findings: disable ignored for a
+    # single-file .gz/.bz2/.xz wrapping a disabled format): a disabled inner
+    # handler is treated as an unextractable binary, so the WHOLE compressed
+    # file copies through unchanged + flagged (the original binary survives).
+    if handler is not None and handler.name in limits.disable:
+        handler = None
 
     if handler is not None:
         nested_limits = ExtractLimits(
-            max_out_bytes=limits.max_out_bytes,
+            max_out_bytes=max(0, limits.max_out_bytes - len(inner)),
             max_depth=limits.max_depth - 1,
             max_members=limits.max_members,
+            disable=limits.disable,
         )
         out_name, out_data, kind, reps = _run_nested(
             handler, inner_name, inner, rel, scrub, nested_limits, write)
@@ -538,7 +580,15 @@ class _ArchiveHandler:
 # audit.verify_tree can re-scan them for residual PII. Binary members that were
 # copied+flagged are intentionally skipped (they were reported, not scrubbed).
 
-def iter_text_members(path: Path, rel: str, limits: ExtractLimits) -> Iterator[tuple[str, str]]:
+# Sentinel yielded in place of member text when archive verification stops early
+# because a cap (max_members / max_out_bytes) tripped. verify_tree turns it into
+# a finding so a partially-scanned archive can never silently pass as clean (the
+# fail-closed guarantee would otherwise be hollow for exactly the archives that
+# outgrew a cap — e.g. a repack whose scrubbed text expanded past max_out_bytes).
+SCAN_TRUNCATED = object()
+
+
+def iter_text_members(path: Path, rel: str, limits: ExtractLimits) -> Iterator[tuple[str, object]]:
     """Yield ``(display_rel, text)`` for each text member of the archive at
     ``path``. ``display_rel`` uses ``archive.zip!member/path`` notation (and
     nests further for archives inside archives). Best-effort: an unreadable or
@@ -551,7 +601,7 @@ def iter_text_members(path: Path, rel: str, limits: ExtractLimits) -> Iterator[t
 
 
 def _iter_text(data: bytes, name: str, rel: str, limits: ExtractLimits,
-               depth: int) -> Iterator[tuple[str, str]]:
+               depth: int) -> Iterator[tuple[str, object]]:
     if depth < 1:
         return
     try:
@@ -592,7 +642,7 @@ def _yield_member_text(name: str, data: bytes, rel: str, limits: ExtractLimits,
 
 
 def _iter_text_zip(data: bytes, rel: str, limits: ExtractLimits,
-                   depth: int) -> Iterator[tuple[str, str]]:
+                   depth: int) -> Iterator[tuple[str, object]]:
     with zipfile.ZipFile(io.BytesIO(data)) as z:
         running = 0
         seen = 0
@@ -604,6 +654,7 @@ def _iter_text_zip(data: bytes, rel: str, limits: ExtractLimits,
                 continue
             seen += 1
             if seen > limits.max_members or running + info.file_size > limits.max_out_bytes:
+                yield f"{rel}!<scan truncated at cap>", SCAN_TRUNCATED
                 return
             try:
                 mdata = z.read(info)
@@ -614,7 +665,7 @@ def _iter_text_zip(data: bytes, rel: str, limits: ExtractLimits,
 
 
 def _iter_text_tar(data: bytes, rel: str, limits: ExtractLimits,
-                   depth: int) -> Iterator[tuple[str, str]]:
+                   depth: int) -> Iterator[tuple[str, object]]:
     with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as t:
         running = 0
         seen = 0
@@ -623,6 +674,7 @@ def _iter_text_tar(data: bytes, rel: str, limits: ExtractLimits,
                 continue
             seen += 1
             if seen > limits.max_members or running + m.size > limits.max_out_bytes:
+                yield f"{rel}!<scan truncated at cap>", SCAN_TRUNCATED
                 return
             src = t.extractfile(m)
             mdata = src.read() if src is not None else b""
