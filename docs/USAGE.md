@@ -404,5 +404,7 @@ Release as the CLI exe on tag pushes.
 | `--include GLOB` / `--exclude GLOB` | scan, strip, verify | Filter files (repeatable). |
 | `--max-bytes N` | scan, strip, verify | Copy files larger than `N` bytes through unprocessed. |
 | `--stream-threshold N` | scan, strip, verify | Stream files larger than `N` bytes (default 50 MB). |
+| `--no-extract` | scan, strip, verify | Disable binary-format extraction (pcap/archive/office/sqlite); restore copy-through + flag. On `verify`, also skips archive recursion. |
+| `--extract-disable NAME` | scan, strip, verify | Disable one extractor by name (`pcap`\|`archive`\|`office`\|`sqlite`); repeatable, also applied to archive members. |
 | `--no-progress` | scan, strip, verify | Suppress the stderr progress bar. |
 | `--map PATH` | reverse | Decode map (`decode.json`) or vault `map.json`. |
