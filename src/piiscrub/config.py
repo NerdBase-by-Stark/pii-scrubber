@@ -16,6 +16,11 @@ from .formats.base import ExtractLimits
 DEFAULT_MAX_BYTES = 1 << 62  # effectively no hard skip; huge files are streamed
 DEFAULT_STREAM_THRESHOLD = 50 * 1024 * 1024  # 50 MB: above this, stream in chunks
 
+# LLM-prep output shaping (design 2026-07-05, decisions #2/#4). Validated on
+# load so a bad TOML value fails fast with a clear message.
+ALIAS_STYLES = ("opaque", "structured")
+OUT_FORMATS = ("text", "csv", "jsonl")
+
 # [extract] defaults — mirror ExtractLimits so the config table is optional.
 DEFAULT_EXTRACT_MAX_OUT_BYTES = ExtractLimits().max_out_bytes   # 512 MB
 DEFAULT_EXTRACT_MAX_DEPTH = ExtractLimits().max_depth           # 3
@@ -48,6 +53,15 @@ class Config:
     exclude: list[str] = field(default_factory=list)
     max_bytes: int = DEFAULT_MAX_BYTES
     stream_threshold: int = DEFAULT_STREAM_THRESHOLD
+    # Output shaping (LLM-prep mode). ``alias_style`` picks the alias grammar
+    # ("opaque" = <IP_1>; "structured" = <IP_NET1_1>, keeps network shape
+    # visible). ``out_format`` reshapes scrubbed text outputs ("text" mirror,
+    # or "csv"/"jsonl" per-line/per-packet records). ``keep_wellknown`` keeps
+    # loopback/broadcast/standard-multicast values verbatim (they identify
+    # nothing); False restores full tokenisation. CLI flags override these.
+    alias_style: str = "opaque"
+    out_format: str = "text"
+    keep_wellknown: bool = True
     # Resolved [extract] table (format extractors). CLI --no-extract /
     # --extract-disable merge on top later.
     extract: ExtractConfig = field(default_factory=ExtractConfig)
@@ -99,6 +113,10 @@ def _merge_raw(base: dict, overlay: dict) -> dict:
         out["max_bytes"] = overlay["max_bytes"]
     if "stream_threshold" in overlay:
         out["stream_threshold"] = overlay["stream_threshold"]
+    # Output-shaping scalars: overlay overrides when present (like max_bytes).
+    for key in ("alias_style", "out_format", "keep_wellknown"):
+        if key in overlay:
+            out[key] = overlay[key]
     # [extract] table: disable list unions (like detector toggles); scalar
     # limits + enabled flag override when the overlay sets them.
     bext = dict(base.get("extract", {}) or {})
@@ -124,6 +142,14 @@ def _merge_raw(base: dict, overlay: dict) -> dict:
 def _config_from_raw(raw: dict) -> Config:
     det = raw.get("detectors", {}) or {}
     custom = [_validate_custom(e, i) for i, e in enumerate(raw.get("custom", []) or [])]
+    alias_style = str(raw.get("alias_style", "opaque"))
+    if alias_style not in ALIAS_STYLES:
+        raise ValueError(
+            f"alias_style must be one of {'|'.join(ALIAS_STYLES)}, got {alias_style!r}")
+    out_format = str(raw.get("out_format", "text"))
+    if out_format not in OUT_FORMATS:
+        raise ValueError(
+            f"out_format must be one of {'|'.join(OUT_FORMATS)}, got {out_format!r}")
     return Config(
         disable=set(det.get("disable", []) or []),
         enable=set(det.get("enable", []) or []),
@@ -134,6 +160,9 @@ def _config_from_raw(raw: dict) -> Config:
         exclude=list(raw.get("exclude", []) or []),
         max_bytes=int(raw.get("max_bytes", DEFAULT_MAX_BYTES)),
         stream_threshold=int(raw.get("stream_threshold", DEFAULT_STREAM_THRESHOLD)),
+        alias_style=alias_style,
+        out_format=out_format,
+        keep_wellknown=bool(raw.get("keep_wellknown", True)),
         extract=_extract_from_raw(raw.get("extract", {}) or {}),
         llm=dict(raw.get("llm", {}) or {}),
     )

@@ -10,7 +10,11 @@ tree the walker applies at the top level:
   ``.zip``, ``.docx``, ``.db`` …) -> delegated to that handler via the registry,
   depth-capped; its derivative/repacked output is stored in place. If the nested
   handler raises :class:`ExtractError` (not implemented, corrupt, too deep, …)
-  the member is copied in unchanged + flagged, exactly like the top level.
+  the member falls back to the plain TEXT scrub when its bytes decode as text
+  (mirroring the walker's top-level rule for structured sources — a
+  parse-failing ``.json``/``.csv`` IS text and must not ship raw PII), and is
+  copied in unchanged + flagged only when it does not decode, exactly like the
+  top level.
 * unknown-binary member -> copied into the repack unchanged + flagged.
 
 Single-file ``.gz``/``.bz2``/``.xz`` (not ``.tar.*``) are treated as one member:
@@ -327,7 +331,25 @@ def _handle_member(
             out_name, out_data, _kind, reps = _run_nested(
                 handler, name, data, member_rel, scrub, nested_limits, write=True)
         except ExtractError as e:
-            # Fail-open per member: copy the binary in unchanged and flag it.
+            # Fail-open per member — but mirror the walker's top-level rule for
+            # text-decodable sources (structured .csv/.json/.jsonl above all):
+            # a member that IS text must fall back to the plain regex-on-text
+            # scrub, never to copy-through — copying a parse-failing text
+            # member in unchanged would ship raw PII inside the repack. Only a
+            # member whose bytes do not decode as text keeps the old
+            # copy-in-unchanged + flag behaviour. The scrubbed bytes are
+            # counted as this member's output (``len(encoded)``) so the
+            # caller's running max_out_bytes budget debits the fallback text
+            # exactly like an ordinary text member.
+            decoded = decode_bytes(data)
+            if decoded is not None:
+                text, enc = decoded
+                scrubbed, reps = scrub(member_rel, text)
+                encoded = scrubbed.encode(enc)
+                return (name, (encoded if write else None), True, False, reps,
+                        [f"member {name!r}: nested extraction failed ({e}); "
+                         f"scrubbed as plain text"],
+                        len(encoded))
             return (name, data if write else None, False, True, 0,
                     [f"member {name!r}: nested extraction skipped ({e}); "
                      f"copied unchanged (may contain PII)"],
@@ -746,11 +768,16 @@ def _yield_member_text(name: str, data: bytes, rel: str, limits: ExtractLimits,
     member_rel = f"{rel}!{name}"
     suffix = Path(name).suffix.lower()
     handler = get_handler(suffix)
-    if handler is not None:
+    if handler is not None and handler.name != "structured":
         if handler.name == "archive":
             yield from _iter_text(data, name, member_rel, limits, depth - 1)
-        # A non-archive supported-binary appearing raw means its derivative was
-        # not produced (copied+flagged); nothing text to re-scan here.
+        # A non-archive supported-BINARY appearing raw means its derivative was
+        # not produced (copied+flagged); nothing text to re-scan here. A
+        # structured-suffix member (.csv/.json/.jsonl) is NOT skipped this way:
+        # it IS text (scrubbed in place under its own name, or raw inside a
+        # copied-through archive), so it falls through to the normal
+        # decode-and-scan path below — skipping it would let raw PII in a
+        # readable .json member pass verify as clean (fail-open).
         return
     if suffix in BINARY_EXTS:
         return

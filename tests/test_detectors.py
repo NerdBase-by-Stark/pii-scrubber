@@ -57,6 +57,76 @@ def test_custom_pattern_high_priority():
     assert "asset_tag" in out_cats
 
 
+# --------------------------------------------------------------------------
+# Audit blind spots: forms that previously survived BOTH strip and verify
+# (verify runs the same tokenizer, so these were true blind leaks). Each must
+# now be aliased end-to-end; the neighbouring negatives pin the accept
+# filters that keep look-alikes untouched.
+# --------------------------------------------------------------------------
+
+def scrub(text, **kw):
+    dets = build_active(**kw)
+    amap = AliasMap()
+    return tokenize(text, dets, amap)
+
+
+def test_leading_zero_ipv4_aliased():
+    # inet_aton parses leading-zero octets (octal), so this is a real address.
+    out, reps = scrub("host 010.010.010.010 seen")
+    assert out == "host <IP_1> seen"
+    assert [r.category for r in reps] == ["ipv4"]
+
+
+def test_leading_zero_single_octet_aliased():
+    out, reps = scrub("host 192.168.001.100 seen")
+    assert out == "host <IP_1> seen"
+
+
+def test_all_decimal_full_form_ipv6_aliased():
+    out, reps = scrub("addr 1234:5678:9012:3456:7890:1234:5678:9012 x")
+    assert out == "addr <IPV6_1> x"
+    assert [r.category for r in reps] == ["ipv6"]
+
+
+def test_all_short_decimal_groups_still_untouched():
+    # Colon-separated byte/time-style fields: pure decimal, every group <3
+    # chars -> not IPv6. (A uniform 8x2-hex-digit run is claimed by
+    # ptp_clockid instead, so mixed widths pin the ipv6 accept filter.)
+    text = "fields 1:22:3:44:5:66:7:88 x"
+    out, reps = scrub(text)
+    assert out == text
+    assert reps == []
+
+
+def test_cisco_dotted_mac_aliased():
+    out, reps = scrub("mac aabb.ccdd.eeff x")
+    assert out == "mac <MAC_1> x"
+    assert [r.category for r in reps] == ["mac"]
+
+
+def test_dotted_numeric_triplet_untouched():
+    # Serial/part-number shaped: no hex letter -> not a Cisco MAC.
+    text = "serial 1234.5678.9012 x"
+    out, reps = scrub(text)
+    assert out == text
+    assert reps == []
+
+
+def test_v_prefixed_hostname_ip_aliased():
+    # 'dev'/'srv' + IP: the v is part of a word, not a version marker.
+    out, _ = scrub("box dev10.0.0.1 x")
+    assert out == "box dev<IP_1> x"
+    out, _ = scrub("box srv10.0.0.2 x")
+    assert out == "box srv<IP_1> x"
+
+
+def test_version_v_prefix_still_untouched():
+    text = "running v1.2.3.4 build"
+    out, reps = scrub(text)
+    assert out == text
+    assert reps == []
+
+
 def test_jwt_detected():
     jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"  # gitleaks:allow (synthetic jwt.io example token, not a real secret)
     assert "jwt" in cats(f"token {jwt} end")

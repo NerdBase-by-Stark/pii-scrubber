@@ -19,7 +19,7 @@ from . import __version__
 from .audit import reverse_file, verify_tree
 from .config import Config, resolve_config
 from .detectors import build_active
-from .engine import AliasMap
+from .engine import AliasMap, make_structured_style
 from .formats import handler_names
 from . import entities as entities_mod
 from . import llm as llm_mod
@@ -58,6 +58,12 @@ def _merge_cli_into_config(cfg: Config, args: argparse.Namespace) -> Config:
         if args.stream_threshold <= 0:
             raise SystemExit("error: --stream-threshold must be > 0")
         cfg.stream_threshold = args.stream_threshold
+    # Output shaping: a CLI flag (when given) overrides the config/profile value.
+    # argparse ``choices`` already constrain these, so no re-validation here.
+    if getattr(args, "alias_style", None) is not None:
+        cfg.alias_style = args.alias_style
+    if getattr(args, "out_format", None) is not None:
+        cfg.out_format = args.out_format
     # Format extraction toggles merge on top of the [extract] config table.
     if getattr(args, "no_extract", False):
         cfg.extract.enabled = False
@@ -164,7 +170,11 @@ def cmd_scan(args: argparse.Namespace) -> int:
         entities_path = Path(args.entities) if args.entities else None
     entity_dets = _load_entities(amap, entities_path)
     detectors = build_active(disable=cfg.disable, enable=cfg.enable,
-                             custom=cfg.custom, denylist=cfg.denylist) + entity_dets
+                             custom=cfg.custom, denylist=cfg.denylist,
+                             keep_wellknown=cfg.keep_wellknown) + entity_dets
+    # Structured aliases (if requested) so the scan PREVIEW mirrors what strip
+    # would mint; out-format is not applied to scan (write=False → reports only).
+    style = make_structured_style(amap) if cfg.alias_style == "structured" else None
 
     # ---- optional LLM second pass (PREVIEW: nothing is written) ----
     post_pass = None
@@ -194,7 +204,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
                              include=cfg.include, exclude=cfg.exclude,
                              max_bytes=cfg.max_bytes, write=False, exclude_dirs={PII_DIRNAME},
                              stream_threshold=cfg.stream_threshold, progress=progress,
-                             post_pass=post_pass, extract=cfg.extract)
+                             post_pass=post_pass, extract=cfg.extract, style=style)
         pii_dir = src / PII_DIRNAME
         summary = build_summary(mode="scan", src=str(src), dst=None, timestamp=_now(),
                                 version=__version__, amap=amap, stats=stats,
@@ -247,8 +257,15 @@ def cmd_strip(args: argparse.Namespace) -> int:
             entities_path = Path(args.entities) if args.entities else None
 
         entity_dets = _load_entities(amap, entities_path)
+        # keep_wellknown is resolved ONCE here and reused for the auto-verify
+        # below (same ``detectors`` object): strip and its verify MUST agree on
+        # the well-known exemption, else kept well-knowns in the output would be
+        # flagged as leaks (false FAIL) — the critical consistency wiring.
         detectors = build_active(disable=cfg.disable, enable=cfg.enable,
-                                 custom=cfg.custom, denylist=cfg.denylist) + entity_dets
+                                 custom=cfg.custom, denylist=cfg.denylist,
+                                 keep_wellknown=cfg.keep_wellknown) + entity_dets
+        # Structured aliases (design #2) when requested; else opaque prefixes.
+        style = make_structured_style(amap) if cfg.alias_style == "structured" else None
 
         # ---- optional LLM second pass -----------------------------------
         post_pass = None
@@ -281,7 +298,8 @@ def cmd_strip(args: argparse.Namespace) -> int:
                              include=cfg.include, exclude=cfg.exclude,
                              max_bytes=cfg.max_bytes, write=True, exclude_dirs={PII_DIRNAME},
                              stream_threshold=cfg.stream_threshold, progress=progress,
-                             post_pass=post_pass, extract=cfg.extract)
+                             post_pass=post_pass, extract=cfg.extract,
+                             out_format=cfg.out_format, style=style)
 
         manifest = manifest_mod.build_manifest(src, dst, stats, timestamp=ts, version=__version__)
         audit = verify_tree(dst, detectors, cfg.allowlist_cf, extract=cfg.extract)
@@ -348,8 +366,12 @@ def cmd_verify(args: argparse.Namespace) -> int:
     if not dst.is_dir():
         raise SystemExit(f"error: target not a directory: {dst}")
     cfg = _resolve(args)
+    # Same keep_wellknown resolution as strip so a standalone verify inherits the
+    # identical well-known exemption (pass the same --profile/--config used for
+    # strip); otherwise kept well-knowns could be mis-flagged as leaks.
     detectors = build_active(disable=cfg.disable, enable=cfg.enable,
-                             custom=cfg.custom, denylist=cfg.denylist)
+                             custom=cfg.custom, denylist=cfg.denylist,
+                             keep_wellknown=cfg.keep_wellknown)
     audit = verify_tree(dst, detectors, cfg.allowlist_cf, extract=cfg.extract)
     print(json.dumps({"clean": audit["clean"], "leak_count": len(audit["leaks"]),
                       "stray_sidecars": audit["stray_sidecars"],
@@ -524,13 +546,24 @@ def build_parser() -> argparse.ArgumentParser:
                         help="fail-closed: exit non-zero on any LLM error instead of "
                              "warning and continuing")
 
+    def outmode(sp):
+        # LLM-prep output shaping (scan/strip only). CLI overrides config/profile.
+        sp.add_argument("--alias-style", choices=["opaque", "structured"],
+                        dest="alias_style",
+                        help="alias grammar: opaque (<IP_1>, default) or structured "
+                             "(<IP_NET1_1>; keeps subnet/multicast/link-local shape)")
+        sp.add_argument("--out-format", choices=["text", "csv", "jsonl"],
+                        dest="out_format",
+                        help="output shape (strip only): text mirror (default), or "
+                             "csv/jsonl per-line/per-packet records")
+
     s = sub.add_parser("scan", help="dry-run: detect + report, write nothing stripped")
-    s.add_argument("source"); common(s)
+    s.add_argument("source"); common(s); outmode(s)
     s.add_argument("--emit-entities", action="store_true", help="write a starter entity CSV")
     s.set_defaults(func=cmd_scan)
 
     s = sub.add_parser("strip", help="write stripped mirror + decode map + report + manifest, then verify")
-    s.add_argument("source"); s.add_argument("target"); common(s)
+    s.add_argument("source"); s.add_argument("target"); common(s); outmode(s)
     s.add_argument("--emit-entities", action="store_true", help="write a starter entity CSV")
     s.set_defaults(func=cmd_strip)
 

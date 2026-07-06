@@ -641,3 +641,177 @@ def test_decode_name_total_length_capped_against_pointer_bomb():
     # Bounded well under what an uncapped decode would produce (~25 600 labels).
     assert len(name) < 600
     assert name.count(".") < 300
+
+
+# ===========================================================================
+# PTP (Precision Time Protocol, IEEE 1588) dissection — decisions #8/#9.
+# Packets are built byte-by-byte like every other fixture; offsets follow the
+# IEEE 1588-2008 header (34 B) + message bodies.
+
+
+def eui64_from_mac(mac: str) -> bytes:
+    """A MAC-derived EUI-64 clockIdentity: OUI(3) + ff:fe + NIC(3)."""
+    m = _mac_bytes(mac)
+    return m[0:3] + b"\xff\xfe" + m[3:6]
+
+
+def ptp_v2_header(msg_type: int, seq: int, clock_id: bytes, *, domain: int = 0,
+                  port: int = 1, msg_len: int = 0) -> bytes:
+    assert len(clock_id) == 8
+    b = bytearray(34)
+    b[0] = msg_type & 0x0F                 # transportSpecific=0 | messageType
+    b[1] = 0x02                            # versionPTP = 2
+    struct.pack_into(">H", b, 2, msg_len)  # messageLength
+    b[4] = domain                          # domainNumber
+    b[20:28] = clock_id                    # clockIdentity (sourcePortIdentity)
+    struct.pack_into(">H", b, 28, port)    # portNumber
+    struct.pack_into(">H", b, 30, seq)     # sequenceId
+    return bytes(b)
+
+
+def ptp_v2_sync(seq: int, clock_id: bytes, *, sec: int = 0, ns: int = 0,
+                domain: int = 0, port: int = 1) -> bytes:
+    hdr = ptp_v2_header(0x0, seq, clock_id, domain=domain, port=port)
+    return hdr + sec.to_bytes(6, "big") + struct.pack(">I", ns)  # originTimestamp
+
+
+def ptp_v2_announce(seq: int, clock_id: bytes, gm_id: bytes, *, domain: int = 0,
+                    port: int = 1, prio1: int = 128, prio2: int = 128,
+                    steps: int = 1, tsrc: int = 0xA0, utcoff: int = 37,
+                    sec: int = 0, ns: int = 0) -> bytes:
+    assert len(gm_id) == 8
+    hdr = ptp_v2_header(0x0B, seq, clock_id, domain=domain, port=port)
+    body = bytearray(30)                       # packet offsets 34..63
+    body[0:6] = sec.to_bytes(6, "big")         # originTimestamp seconds  @34
+    struct.pack_into(">I", body, 6, ns)        # originTimestamp nanos    @40
+    struct.pack_into(">h", body, 10, utcoff)   # currentUtcOffset i16     @44
+    body[13] = prio1                           # grandmasterPriority1     @47
+    body[18] = prio2                           # grandmasterPriority2     @52
+    body[19:27] = gm_id                        # grandmasterIdentity      @53
+    struct.pack_into(">H", body, 27, steps)    # stepsRemoved             @61
+    body[29] = tsrc                            # timeSource               @63
+    return hdr + bytes(body)
+
+
+def ptp_v1_sync(seq: int, uuid_mac: str, *, subdomain: str = "_DFLT",
+                control: int = 0, source_port: int = 1) -> bytes:
+    b = bytearray(40)
+    struct.pack_into(">H", b, 0, 1)            # versionPTP = 1
+    struct.pack_into(">H", b, 2, 1)            # versionNetwork
+    sd = subdomain.encode("ascii")[:16]
+    b[4:4 + len(sd)] = sd                      # subdomain @4 (null-padded ASCII)
+    b[20] = 0x01                               # messageType (unused by dissector)
+    b[21] = 0x01                               # sourceCommunicationTechnology
+    b[22:28] = _mac_bytes(uuid_mac)            # sourceUuid @22 (a MAC)
+    struct.pack_into(">H", b, 28, source_port)  # sourcePortId @28
+    struct.pack_into(">H", b, 30, seq)         # sequenceId @30
+    b[32] = control                            # control @32
+    return bytes(b)
+
+
+def test_ptp_v2_announce_udp_mac_identities(tmp_path: Path):
+    # v2 Announce over IPv4/UDP 320 (PTP general) with MAC-derived identities:
+    # scalar fields survive, identities become reconstructed MACs then aliases.
+    clock_mac = "aa:bb:cc:dd:ee:41"
+    gm_mac = "aa:bb:cc:dd:ee:42"
+    ann = ptp_v2_announce(1234, eui64_from_mac(clock_mac), eui64_from_mac(gm_mac))
+    pkt = eth("01:1b:19:00:00:00", "aa:bb:cc:dd:ee:40", 0x0800,
+              ipv4("192.0.2.10", "224.0.1.129", 17, udp(320, 320, ann)))
+    _, text, _ = run(tmp_path, classic_pcap([(1, 0, pkt)]))
+    assert "ptp v2 announce dom=0 seq=1234" in text
+    assert "prio1=128" in text and "prio2=128" in text
+    assert "steps=1" in text and "tsrc=0xa0" in text and "utcoff=37" in text
+    assert "clockid mac=<MAC" in text and "gm mac=<MAC" in text
+    assert "eui64" in text
+    for raw_val in (clock_mac, gm_mac):
+        assert raw_val not in text
+
+
+def test_ptp_v2_sync_l2_ethertype(tmp_path: Path):
+    # v2 Sync over L2 ethertype 0x88F7 (no IP/UDP); origin timestamp survives.
+    dev_mac = "aa:bb:cc:dd:ee:51"
+    sync = ptp_v2_sync(7, eui64_from_mac(dev_mac), sec=1000, ns=500)
+    pkt = eth("01:1b:19:00:00:00", dev_mac, 0x88F7, sync)
+    _, text, _ = run(tmp_path, classic_pcap([(1, 0, pkt)]))
+    assert "type=0x88f7" in text
+    assert "ptp v2 sync dom=0 seq=7" in text
+    assert "clockid mac=<MAC" in text and "eui64" in text
+    assert "origin_ts=1000.000000500" in text
+    assert dev_mac not in text
+
+
+def test_ptp_v2_sync_l2_vlan_tagged(tmp_path: Path):
+    # Same as above but 802.1Q-tagged: VLAN recursion must still reach PTP.
+    dev_mac = "aa:bb:cc:dd:ee:52"
+    sync = ptp_v2_sync(8, eui64_from_mac(dev_mac), sec=2000, ns=0)
+    pkt = vlan_eth("01:1b:19:00:00:00", dev_mac, 100, 0x88F7, sync)
+    _, text, _ = run(tmp_path, classic_pcap([(1, 0, pkt)]))
+    assert "[vlan 100]" in text
+    assert "ptp v2 sync dom=0 seq=8" in text
+    assert "clockid mac=<MAC" in text
+    assert dev_mac not in text
+
+
+def test_ptp_v2_non_eui64_identity_emits_8group_hex(tmp_path: Path):
+    # A clockIdentity whose middle bytes are NOT ff:fe/ff:ff is NOT a MAC-derived
+    # EUI-64: it must be emitted as canonical 8-group colon-hex, with no false MAC
+    # reconstruction. Asserted on the dissection TEXT directly (pre-scrub), since
+    # the ptp_clockid detector would otherwise alias the 8-group form.
+    from piiscrub.formats.pcap import _Sink, _dissect_ptp
+
+    clock_id = b"\xaa\xbb\xcc\x11\x22\xdd\xee\xff"   # middle bytes 11:22, not ff:fe
+    gm_id = b"\x00\x11\x22\x33\x44\x55\x66\x77"
+    ann = ptp_v2_announce(99, clock_id, gm_id)
+    sink = _Sink(1 << 20)
+    _dissect_ptp(ann, sink)
+    text = sink.text()
+    assert "clockid aa:bb:cc:11:22:dd:ee:ff" in text
+    assert "gm 00:11:22:33:44:55:66:77" in text
+    # No false EUI-64 reconstruction: middle bytes not stripped, no mac=/eui64.
+    assert "mac=" not in text
+    assert "eui64" not in text
+    assert "ff:fe" not in text
+
+
+def test_ptp_v1_sync_udp_uuid_is_mac(tmp_path: Path):
+    # PTPv1 (Dante) Sync over UDP 319: sourceUuid IS a MAC -> "uuid mac=" aliased.
+    uuid_mac = "aa:bb:cc:dd:ee:61"
+    v1 = ptp_v1_sync(4242, uuid_mac, subdomain="_DFLT", control=0)
+    pkt = eth("01:1b:19:00:00:00", "aa:bb:cc:dd:ee:60", 0x0800,
+              ipv4("192.0.2.20", "224.0.1.129", 17, udp(319, 319, v1)))
+    _, text, _ = run(tmp_path, classic_pcap([(1, 0, pkt)]))
+    assert "ptp v1 sync" in text
+    assert "uuid mac=" in text
+    assert "seq=4242" in text and "dom=_DFLT" in text
+    assert uuid_mac not in text
+    assert "<MAC_" in text
+
+
+def test_ptp_truncated_payload_falls_back_to_strings(tmp_path: Path):
+    # A PTPv2 version nibble but a payload far shorter than the 34-byte header:
+    # must NOT raise and must degrade to printable-string extraction.
+    short = bytes([0x00, 0x02]) + b"PTPSHORTSTRING01"       # 18 bytes, < 34
+    pkt = eth("11:22:33:44:55:66", "aa:bb:cc:dd:ee:71", 0x0800,
+              ipv4("192.0.2.30", "224.0.1.129", 17, udp(1, 320, short)))
+    outcome, text, _ = run(tmp_path, classic_pcap([(1, 0, pkt)]))
+    assert outcome.kind == "derivative"            # no crash / no ExtractError
+    assert "ptp v2" not in text                     # header too short to decode
+    assert 'payload "PTPSHORTSTRING01"' in text     # strings fallback ran
+
+
+def test_ptp_clockid_eui64_shares_l2_mac_alias(tmp_path: Path):
+    # Full pipeline: the SAME device MAC appears as the eth SOURCE and, EUI-64-
+    # encoded, inside the PTP clockIdentity. Both must alias to ONE <MAC_n> (leak
+    # closed, correlation preserved); the origin timestamp survives verbatim.
+    dev_mac = "aa:bb:cc:dd:ee:ff"
+    sync = ptp_v2_sync(1234, eui64_from_mac(dev_mac),
+                       sec=1609556645, ns=250000000)
+    pkt = eth("01:1b:19:00:00:00", dev_mac, 0x88F7, sync)
+    _, text, amap = run(tmp_path, classic_pcap([(1, 0, pkt)]))
+    assert dev_mac not in text                       # raw MAC never leaks
+    mac_aliases = [a for a, m in amap.decode_table().items()
+                   if m["category"] == "mac" and m["original"] == dev_mac]
+    assert len(mac_aliases) == 1                      # one alias for the device MAC
+    alias = mac_aliases[0]
+    assert text.count(alias) >= 2                     # eth line AND clockid line
+    assert "origin_ts=1609556645.250000000" in text   # timestamp verbatim

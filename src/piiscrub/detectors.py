@@ -12,8 +12,9 @@ Windows .exe stays small and low-AV-risk.
 
 from __future__ import annotations
 
+import ipaddress
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable
 
 
@@ -69,19 +70,129 @@ def _ipv4_accept(m: re.Match, text: str) -> bool:
     tail = text[line_start:m.start()][-24:]
     if _VER_KEYWORD_TAIL.search(tail):
         return False
-    if m.start() > 0 and text[m.start() - 1] in "vV":
-        return False
+    i = m.start()
+    if i > 0 and text[i - 1] in "vV":
+        # Version marker only at a token boundary: "v1.2.3.4" is a version,
+        # but "dev10.0.0.1" / "srv10.0.0.2" are hostname-prefixed IPs — keep
+        # those (drop only when the v is NOT preceded by another alnum).
+        if i < 2 or not text[i - 2].isalnum():
+            return False
     return True
 
 
 def _ipv6_full_accept(m: re.Match, _text: str) -> bool:
-    # Require a hex letter so pure-decimal time-shaped groups don't match.
+    # Drop pure-decimal ALL-short-group sequences (colon-separated byte/time
+    # fields like 1:22:3:44:…) — but keep realistic decimal-only IPv6: accept
+    # when a hex letter is present OR any group has 3+ digits (zone stripped
+    # first so "%eth0" letters can't vouch for a decimal address).
+    value = m.group(0).split("%", 1)[0]
+    if re.search(r"[a-fA-F]", value):
+        return True
+    return any(len(g) >= 3 for g in value.split(":"))
+
+
+def _mac_cisco_accept(m: re.Match, _text: str) -> bool:
+    # Require a hex letter so dotted numeric triplets ("1234.5678.9012"
+    # serial/part numbers) stay untouched.
     return bool(re.search(r"[a-fA-F]", m.group(0)))
 
 
 def _phone_accept(m: re.Match, _text: str) -> bool:
     digits = re.sub(r"\D", "", m.group(0))
     return 10 <= len(digits) <= 15
+
+
+# ----------------------------------------------------------------------
+# Well-known addresses
+# ----------------------------------------------------------------------
+# Values that are identical on every network and identify nothing (loopback,
+# broadcast, standard multicast groups). Kept verbatim by default:
+# build_active() wraps the ipv4/ipv6/mac accept filters so these matches are
+# dropped, and verify inherits the exemption because it runs the same
+# detectors. keep_wellknown=False restores full tokenisation.
+
+_WK_IPV4_EXACT = frozenset({
+    ipaddress.IPv4Address("0.0.0.0"),           # unspecified / "this host"
+    ipaddress.IPv4Address("255.255.255.255"),   # limited broadcast
+})
+_WK_IPV4_NETS = (
+    ipaddress.IPv4Network("127.0.0.0/8"),    # loopback
+    ipaddress.IPv4Network("224.0.0.0/24"),   # local control (mDNS .251, LLMNR .252, …)
+)
+_WK_IPV4_PTP_LO = int(ipaddress.IPv4Address("224.0.1.129"))  # PTP primary …
+_WK_IPV4_PTP_HI = int(ipaddress.IPv4Address("224.0.1.132"))  # … + alternates 1-3
+
+_WK_IPV6_EXACT = frozenset({
+    ipaddress.IPv6Address("::"),         # unspecified
+    ipaddress.IPv6Address("::1"),        # loopback
+    ipaddress.IPv6Address("ff02::1"),    # all-nodes
+    ipaddress.IPv6Address("ff02::2"),    # all-routers
+    ipaddress.IPv6Address("ff02::fb"),   # mDNS
+    ipaddress.IPv6Address("ff02::1:2"),  # DHCPv6
+    ipaddress.IPv6Address("ff02::6b"),   # PTP peer-delay
+})
+
+_WK_MAC_BROADCAST = "ff:ff:ff:ff:ff:ff"
+_WK_MAC_PREFIXES = (
+    "01:00:5e:",  # IPv4 multicast
+    "33:33:",     # IPv6 multicast
+    "01:1b:19:",  # PTP
+    "01:80:c2:",  # STP/LLDP/PTP-peer
+)
+
+
+def _is_wellknown_ipv4(value: str) -> bool:
+    # Parse defensively: a regex-matched string can still fail to parse.
+    try:
+        ip = ipaddress.IPv4Address(value)
+    except ValueError:
+        return False
+    if ip in _WK_IPV4_EXACT or any(ip in net for net in _WK_IPV4_NETS):
+        return True
+    return _WK_IPV4_PTP_LO <= int(ip) <= _WK_IPV4_PTP_HI
+
+
+def _is_wellknown_ipv6(value: str) -> bool:
+    try:
+        ip = ipaddress.IPv6Address(value.split("%", 1)[0])  # drop zone index
+    except ValueError:
+        return False
+    if ip in _WK_IPV6_EXACT:
+        return True
+    # PTP primary group ff0X::181 — well-known at ANY scope nibble X.
+    p = ip.packed
+    return (p[0] == 0xFF and p[1] >> 4 == 0
+            and not any(p[2:14]) and p[14] == 0x01 and p[15] == 0x81)
+
+
+def _is_wellknown_mac(value: str) -> bool:
+    mac = value.casefold().replace("-", ":")
+    if mac.startswith("33:33:ff:"):
+        # Solicited-node multicast (33:33:ff:xx:xx:xx) embeds the low 3 bytes
+        # of a host's IPv6 interface-id — identifying, so NOT well-known even
+        # though it sits inside the 33:33:* IPv6-multicast prefix.
+        return False
+    return mac == _WK_MAC_BROADCAST or mac.startswith(_WK_MAC_PREFIXES)
+
+
+_WK_PREDICATES: dict[str, Callable[[str], bool]] = {
+    "ipv4": _is_wellknown_ipv4,
+    "ipv6": _is_wellknown_ipv6,
+    "mac": _is_wellknown_mac,
+}
+
+
+def _wrap_keep_wellknown(det: Detector, is_wk: Callable[[str], bool]) -> Detector:
+    """Return a copy of ``det`` whose accept also drops well-known values
+    (leaving them verbatim in the text). The existing filter still applies."""
+    inner = det.accept
+
+    def accept(m: re.Match, text: str) -> bool:
+        if inner is not None and not inner(m, text):
+            return False
+        return not is_wk(m.group(0))
+
+    return replace(det, accept=accept)
 
 
 # ----------------------------------------------------------------------
@@ -95,7 +206,22 @@ _TLDS = (
     r"invalid|uk|de|ch|fr|nl|us|jp|cn|in|ru|ca|au|eu|es|it|se|no|fi|pl|br|za"
 )
 
-_OCTET = r"(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)"
+# One dotted-quad octet. ``0\d{1,2}`` admits inet_aton-style leading zeros
+# ("010", "001" — max 3 chars, value necessarily ≤ 99 so range logic holds);
+# the ipv6 compressed detector's v4-mapped tail shares this and inherits it.
+_OCTET = r"(?:25[0-5]|2[0-4]\d|1\d\d|0\d{1,2}|[1-9]?\d)"
+
+# Trailing guard for a dotted quad (ipv4 detector and the IPv6 dotted tail).
+# A dotted quad must not continue with ".digit" or a bare digit (version-style
+# runs like 1.2.3.4.5 stay untouched), and must not be the head of a larger
+# FQDN ("192.0.2.10.example.com" — the fqdn detector claims the whole name;
+# splitting it would leak the domain tail). A dot NOT followed by either — a
+# sentence period, ellipsis, or PTR ".in-addr.arpa" — no longer blocks the
+# match ("arpa" is not a recognised TLD, and "in" is followed by "-").
+_V4_TAIL_GUARD = (
+    r"(?!\.?\d)"
+    rf"(?!(?i:\.(?:[A-Za-z0-9][A-Za-z0-9-]{{0,62}}\.)*(?:{_TLDS})(?![\w-])))"
+)
 
 BUILTIN_DETECTORS: list[Detector] = [
     Detector(
@@ -153,15 +279,46 @@ BUILTIN_DETECTORS: list[Detector] = [
         priority=65, on_by_default=True,
     ),
     Detector(
+        # Cisco dotted MAC notation (aabb.ccdd.eeff). Same category as the
+        # colon/dash detector below (two detectors, one category — like ipv6).
+        # Known limitation: alias keys are raw-value based, so the same
+        # physical MAC in colon and Cisco notation gets two different aliases
+        # — acceptable, each notation is internally consistent. Listed BEFORE
+        # the colon form so classify_identifier's last-wins category map keeps
+        # the colon detector as the "mac" representative.
+        "mac", "MAC",
+        re.compile(r"(?<![\w.])(?:[0-9A-Fa-f]{4}\.){2}[0-9A-Fa-f]{4}(?![\w.])"),
+        priority=60, on_by_default=True, casefold_key=True,
+        accept=_mac_cisco_accept,
+    ),
+    Detector(
         "mac", "MAC",
         re.compile(r"(?<![\w:-])(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}(?![\w:-])"),
         priority=60, on_by_default=True, casefold_key=True,
     ),
     Detector(
+        # PTPv2 clockIdentity (EUI-64) as 8 colon-hex bytes, e.g. from the
+        # pcap dissector. Priority must beat ipv6 (55) so an 8×2-hex-digit
+        # string is claimed as CLOCKID, not IPV6; mac is 6 groups, unaffected.
+        "ptp_clockid", "CLOCKID",
+        re.compile(r"(?<![\w:-])(?:[0-9A-Fa-f]{2}:){7}[0-9A-Fa-f]{2}(?![\w:-])"),
+        priority=58, on_by_default=True, casefold_key=True,
+    ),
+    Detector(
+        # Compressed form. The pre-:: groups must be part of the match: the
+        # well-known exemption parses the matched value, so a truncated match
+        # ("::fb" out of "ff02::fb") would misclassify against the list.
+        # The final part may be a dotted-quad IPv4 tail (RFC 4291
+        # IPv4-mapped/compatible, e.g. ::ffff:192.0.2.1) so the whole literal
+        # is claimed — otherwise the ipv4 candidate loses the overlap and most
+        # of a real IPv4 leaks. A final hex group must not be followed by
+        # ".digit" (a half-eaten dotted tail, or ratio-like text such as 1::2.5).
         "ipv6", "IPV6",
         re.compile(
-            r"\b(?:[0-9a-fA-F]{1,4}:)*::(?:[0-9a-fA-F]{1,4}:)*[0-9a-fA-F]{0,4}"
-            r"(?:%[A-Za-z0-9_]+)?\b"
+            r"(?<![\w:])(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4})*)?::"
+            r"(?:(?:[0-9A-Fa-f]{1,4}:)*"
+            rf"(?:(?:{_OCTET}\.){{3}}{_OCTET}{_V4_TAIL_GUARD}|[0-9A-Fa-f]{{1,4}}(?!\.\d)))?"
+            r"(?:%[A-Za-z0-9_]+)?(?![\w:])"
         ),
         priority=55, on_by_default=True, casefold_key=True,
     ),
@@ -176,7 +333,7 @@ BUILTIN_DETECTORS: list[Detector] = [
     Detector(
         "ipv4", "IP",
         re.compile(
-            rf"(?<![\d.])(?:{_OCTET}\.){{3}}{_OCTET}(?![\d.])"
+            rf"(?<![\d.])(?:{_OCTET}\.){{3}}{_OCTET}{_V4_TAIL_GUARD}"
         ),
         priority=50, on_by_default=True, accept=_ipv4_accept,
     ),
@@ -255,11 +412,15 @@ def build_active(
     enable: set[str] | None = None,
     custom: list[dict] | None = None,
     denylist: list[str] | None = None,
+    keep_wellknown: bool = True,
 ) -> list[Detector]:
     """Return the active detector list.
 
     - built-ins are included when ``on_by_default`` and not in ``disable``,
       or when their category is explicitly in ``enable``.
+    - ``keep_wellknown`` (default True) keeps well-known ipv4/ipv6/mac values
+      verbatim by wrapping those detectors' accept filters; False restores
+      full tokenisation.
     - ``custom`` entries (dicts: name, type=regex|literal, value) get high
       priority so a specific operator rule beats a generic built-in.
     - ``denylist`` literals get top priority (always tokenised).
@@ -272,6 +433,8 @@ def build_active(
         if d.category in disable:
             continue
         if d.on_by_default or d.category in enable:
+            if keep_wellknown and d.category in _WK_PREDICATES:
+                d = _wrap_keep_wellknown(d, _WK_PREDICATES[d.category])
             out.append(d)
 
     for entry in (custom or []):

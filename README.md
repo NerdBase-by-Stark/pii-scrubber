@@ -2,11 +2,21 @@
 
 ![CodeRabbit Pull Request Reviews](https://img.shields.io/coderabbit/prs/github/NerdBase-by-Stark/pii-scrubber?utm_source=oss&utm_medium=github&utm_campaign=NerdBase-by-Stark%2Fpii-scrubber&labelColor=171717&color=FF570A&link=https%3A%2F%2Fcoderabbit.ai&label=CodeRabbit+Reviews)
 
-Reusable, **local-only** PII pseudonymiser for log and text trees. Point it at a
-folder; it writes stripped copies into a new folder and keeps the decode map with
-the originals. The same real value always maps to the same opaque alias
-(`<IP_7>`, `<EMAIL_3>`), so analysts keep correlation without ever seeing the
-real values. Fully reversible from the decode map.
+The north-star job: take messy, multi-source network/AV diagnostic data —
+packet captures, device logs, config/CSV exports pulled from dozens of vendors
+and devices across different times and clocks — and turn it into something
+you can safely hand to a **cloud LLM** for analysis. Every real value (IP,
+MAC, hostname, email, credential, …) is replaced by a stable opaque token, the
+same real value always mapping to the same token everywhere in a run, so an
+LLM (or a person) can still correlate across sources without ever seeing what
+a value actually is. The tool keeps **a local map you can use to put the real
+values back** once you have the answer — see
+[How re-identification works](#how-re-identification-works) below.
+
+The same engine also does the simpler job: a plain, mirror-format stripped
+copy of a log tree for sharing with a person or team (the default `generic`
+profile). LLM-prep is one flag away (`--profile llm`). One tool, one shared
+identity map, two output shapes.
 
 Generalised from an internal log-redaction toolset into a general-purpose tool
 for many log types. **Stdlib-only at runtime** (needs Python 3.11+ for
@@ -18,22 +28,74 @@ small and low-AV-risk.
 > a **local** model and **hard-gates** any non-local endpoint behind `--allow-cloud`
 > (without it a remote endpoint is refused and nothing is sent). The decode map,
 > the `_pii/` sidecar, and any project vault contain the real PII and must
-> **never** be committed or shared. See [SECURITY.md](SECURITY.md).
+> **never** be committed or shared — that includes never sending it to an LLM,
+> local or cloud; see [How re-identification works](#how-re-identification-works)
+> and [SECURITY.md](SECURITY.md).
+
+---
+
+## How re-identification works
+
+1. `piiscrub strip` writes a stripped tree containing only tokens
+   (`<IP_NET1_3>`, `<EMAIL_1>`, …) plus a **local decode map**
+   (`_pii/decode.json`, or the project vault's `map.json`). The LLM only ever
+   sees the stripped tree — never a real IP, MAC, hostname, or credential.
+2. The decode map **never leaves your machine.** Don't paste it, upload it, or
+   attach it to a prompt — sending it to any LLM (even a local one, if the
+   session or logs leave the box) re-uploads exactly the PII you stripped it
+   to avoid.
+3. Send the stripped tree — or the LLM-prep `.jsonl`/`.csv` records from
+   `--profile llm` — to the LLM for analysis. If you want its report to keep
+   tokens intact rather than paraphrasing them, tell the LLM the **token
+   convention** — e.g. "tokens look like `<IP_NET1_3>` or `<MCAST_1>`; keep
+   them verbatim in your answer" — **never the real values behind them.**
+4. Run the LLM's response back through `piiscrub reverse` with the same decode
+   map (`--map ./logs/_pii/decode.json`, or the vault's `map.json`) to put the
+   real values back — entirely on your machine.
 
 ---
 
 ## Features
 
-- **One reversible alias map** — the same real value always maps to the same opaque
-  alias (`<IP_7>`, `<EMAIL_3>`) across every file in a run, so analysts keep
-  correlation without seeing real values; fully reversible from the decode map.
+- **One shared alias map** — the same real value always maps to the same opaque
+  alias (`<IP_7>`, `<EMAIL_3>`) across every file in a run, so analysts (or an
+  LLM) keep correlation without seeing real values; the tool keeps a local map
+  you can use to put the real values back.
 - **16+ built-in detectors** — IPv4/IPv6, MAC, email, URL, FQDN/hostname, UUID, JWT,
   AWS/Google API keys, Bearer tokens, PEM private-key blocks, Luhn-checked credit
   cards, Windows user paths, Windows SIDs (phone opt-in). Single-pass,
   priority-ordered, overlap-safe — a URL never becomes a tangle of nested aliases.
+- **Well-known / multicast addresses kept verbatim** — mDNS/LLMNR/PTP multicast
+  (e.g. `224.0.1.129`, `224.0.0.251`) and broadcast addresses are **not**
+  tokenised by default, so packet dumps stay structurally readable; org-chosen
+  multicast groups are still aliased. Config `keep_wellknown = false` restores
+  full tokenisation of these too.
+- **`--alias-style structured`** — new plain aliases become subnet/role-aware
+  (`<IP_NET1_7>` grouped by /24, `<MCAST_1>` for multicast, `<MACMC_1>` for
+  multicast MACs) instead of opaque `<IP_7>`, so an LLM can see which addresses
+  share a subnet and which are multicast vs unicast without ever seeing a real
+  value. Default stays `opaque` (today's behaviour).
+- **`--out-format csv|jsonl`** — reshapes scrubbed text output into per-line
+  (`{src, n, ts, text}`) or, for pcap derivatives, per-packet (`{src, packet,
+  ts, text}`) records — built for feeding straight to an LLM. Default stays
+  `text` (today's mirrored files).
+- **`--profile llm`** — one flag bundling the LLM-prep defaults
+  (`--alias-style structured` + `--out-format jsonl`); well-known addresses are
+  already kept verbatim regardless of profile.
+- **PTP v1/v2 decode** — the pcap dissector understands PTP (ports 319/320 and
+  ethertype `0x88F7`): message type, domain, sequence ID, priorities, and
+  grandmaster/clock identities. A MAC-derived clock identity is aliased to the
+  *same* `<MAC_n>` as the device's Ethernet MAC, so a PTP grandmaster and its
+  NIC correlate as one device; timestamps are preserved verbatim.
+- **Field-aware `.csv`/`.json`/`.jsonl` scrubbing** — these are parsed and every
+  string value scrubbed individually; keys/columns and document structure stay
+  intact, so the output is still a valid CSV / JSON / JSON Lines file.
+- **Timestamps are never scrubbed** — they're the correlation key that lets you
+  line up events across packet captures, device logs, and exports from
+  different sources.
 - **Custom rules + profiles** — `piiscrub.toml` (custom regex/literal patterns,
   allow/deny lists, detector toggles, include/exclude globs) and named profiles
-  (`generic`, `network-gear`, `syslog`, `windows-logs`, `pcap-text`).
+  (`generic`, `network-gear`, `syslog`, `windows-logs`, `pcap-text`, `llm`).
 - **Cross-run project vault** — one alias map shared across runs, vendors, dates and
   log types, so the same value correlates across an entire investigation.
 - **Entity grouping** — link a thing's identifiers (IP + hostname + MAC) into one
@@ -167,6 +229,9 @@ include   = []                       # globs to include; [] means "all files"
 exclude   = ["*.min.js", "vendor/**"]
 allowlist = ["pool.ntp.org"]         # literal values to NEVER tokenise
 denylist  = ["ProjectFalcon"]        # literal values to ALWAYS tokenise (case-insensitive)
+alias_style = "opaque"               # "opaque" (default) or "structured" (LLM-prep)
+out_format  = "text"                 # "text" (default), "csv", or "jsonl" (LLM-prep)
+keep_wellknown = true                # false also tokenises well-known/multicast addresses
 
 [detectors]
 disable = ["credit_card"]            # turn built-ins off
@@ -195,6 +260,7 @@ the config:
 --include GLOB      --exclude GLOB      (repeatable globs)
 --max-bytes N       --stream-threshold N
 --no-extract        --extract-disable NAME   (repeatable; format extraction toggles)
+--alias-style STYLE --out-format FORMAT      (opaque|structured; text|csv|jsonl — LLM-prep)
 ```
 
 ---
@@ -204,7 +270,7 @@ the config:
 Named preset bundles for common log types, selected with `--profile`:
 
 ```
-generic | network-gear | syslog | windows-logs | pcap-text
+generic | network-gear | syslog | windows-logs | pcap-text | llm
 ```
 
 * `generic` — everything on, no extra filtering.
@@ -213,6 +279,9 @@ generic | network-gear | syslog | windows-logs | pcap-text
 * `syslog` — includes `*.log`, `*.txt`.
 * `windows-logs` — includes `*.log`, `*.txt`, `*.csv`.
 * `pcap-text` — includes `*.txt`, `*.csv` (packet captures exported to text).
+* `llm` — the LLM-prep bundle: `--alias-style structured` + `--out-format
+  jsonl`. Well-known addresses are kept verbatim regardless of profile (that's
+  the default, not something this profile turns on).
 
 Layering order: **profile → `--config` file → CLI flags** (later layers win or
 union, as appropriate).
@@ -350,6 +419,10 @@ is stored under `runs/<timestamp>/`.
     **repacked in the same format** with every member scrubbed by this same
     decision tree (text tokenised; supported binary member dissected; unknown
     binary member copied in + flagged).
+  * `.csv` / `.json` / `.jsonl` → **field-aware**: parsed, every string value
+    scrubbed individually, re-serialised in the **same format and name**
+    (keys/columns untouched, output stays valid CSV/JSON/JSON Lines) — this is
+    the `structured` extractor, on by default alongside the binary ones above.
 
   The **original binary is not copied into the output** when a derivative is
   produced (it would carry the very PII we scrubbed); the report's `extracted`
@@ -362,9 +435,11 @@ is stored under `runs/<timestamp>/`.
     unchanged and flagged (on `verify` it also skips archive recursion — a
     documented weaker guarantee).
   * `--extract-disable NAME` (repeatable) disables one extractor by name
-    (`pcap` | `archive` | `office` | `sqlite`); its files — **including members
-    inside archives** — are copied through unchanged + flagged instead of
-    dissected. An unknown name is rejected fast rather than silently ignored.
+    (`pcap` | `archive` | `office` | `sqlite` | `structured`); its files —
+    **including members inside archives** — are copied through unchanged +
+    flagged instead of dissected (`structured` files fall back to plain
+    regex-on-text scrubbing, not copy-through — they're text, not binary). An
+    unknown name is rejected fast rather than silently ignored.
   * The `[extract]` TOML table sets the same options plus the guard rails
     (`disable`, `max_out_bytes`, `max_depth`, `max_members`); see
     [`docs/USAGE.md`](docs/USAGE.md).
@@ -486,3 +561,4 @@ right-click → **Properties** → **Unblock** → OK.
 * [`CONTRIBUTING.md`](CONTRIBUTING.md) — dev setup and tests.
 * [`SECURITY.md`](SECURITY.md) — responsible disclosure and the local-only data rules.
 * [`docs/plans/2026-06-18-pii-scrubber-design.md`](docs/plans/2026-06-18-pii-scrubber-design.md) — design rationale and roadmap.
+* [`docs/plans/2026-07-05-llm-prep-mode-design.md`](docs/plans/2026-07-05-llm-prep-mode-design.md) — LLM-prep mode: alias styles, out-formats, PTP decode.

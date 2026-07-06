@@ -16,8 +16,11 @@ streaming path matches the whole-file not-processed contract exactly.
 from __future__ import annotations
 
 import codecs
+import csv
 import fnmatch
+import json
 import os
+import re
 import shutil
 import tempfile
 import warnings
@@ -221,6 +224,158 @@ def iter_files(src: Path, exclude_dirs: set[str]) -> list[Path]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Out-format adapter (--out-format text|csv|jsonl). "text" is the default and
+# means exactly today's mirror behaviour (nothing below runs). For csv/jsonl the
+# scrubbed TEXT outputs (plain files, the streaming path, and .txt derivatives
+# from pcap/office/sqlite) are re-shaped AT WRITE TIME into per-line records
+# ({"src", "n", "ts", "text"}) — except pcap derivatives, which group per packet
+# ({"src", "packet", "ts", "text"}). Structured (csv/json/jsonl) handler outputs
+# and repacked archives are NEVER re-shaped (no double-wrapping; archives keep
+# their text members). See docs/plans/2026-07-05-llm-prep-mode-design.md #4/#5.
+
+OUT_FORMATS = ("text", "csv", "jsonl")
+
+# A pcap-derivative packet block header: ``# packet <N> ts=<value> caplen=...``.
+# ``ts=n/a`` (pcapng SPB, which carries no capture timestamp) maps to null.
+_PACKET_HDR_RE = re.compile(r"^# packet (\d+) ts=(\S+)")
+
+# ts extraction (best-effort, NEVER synthesised; the matched substring passes
+# through EXACTLY as it appears — timestamps are a sacred correlation key and are
+# never reformatted). Leading ISO-8601 (T or space separator, optional fraction/
+# offset/Z), leading syslog date ('Mon dd hh:mm:ss', incl. the double-space day),
+# or a ``ts=<value>`` field anywhere in the line (pcap headers).
+_ISO_TS_RE = re.compile(
+    r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?")
+_SYSLOG_TS_RE = re.compile(
+    r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
+    r"\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}")
+_TS_FIELD_RE = re.compile(r"ts=(\S+)")
+
+
+def _extract_ts(line: str) -> str | None:
+    """Best-effort timestamp for one line, or None. Returns the exact substring
+    as it appears (never reformatted)."""
+    s = line.lstrip()
+    m = _ISO_TS_RE.match(s)
+    if m:
+        return m.group(0)
+    m = _SYSLOG_TS_RE.match(s)
+    if m:
+        return m.group(0)
+    m = _TS_FIELD_RE.search(line)
+    if m:
+        val = m.group(1)
+        return None if val == "n/a" else val
+    return None
+
+
+def _iter_lines(text: str):
+    """Yield each line of ``text`` (one record per line). A single trailing
+    newline is a terminator, not an empty final line; internal blank lines are
+    kept. A trailing carriage-return (CRLF input) is dropped from each line."""
+    if text == "":
+        return
+    parts = text.split("\n")
+    if parts and parts[-1] == "":
+        parts.pop()
+    for line in parts:
+        yield line[:-1] if line.endswith("\r") else line
+
+
+def _iter_packet_blocks(text: str):
+    """Yield ``(packet_number|None, ts|None, block_text)`` for each
+    ``# packet N ts=...`` block of a pcap derivative. ``block_text`` includes the
+    header line. Any lines before the first packet header (rare structural
+    warnings) form one leading block with a None packet number."""
+    num: int | None = None
+    ts: str | None = None
+    buf: list[str] = []
+    for line in _iter_lines(text):
+        m = _PACKET_HDR_RE.match(line)
+        if m:
+            if buf:
+                yield num, ts, "\n".join(buf)
+            buf = [line]
+            num = int(m.group(1))
+            ts_raw = m.group(2)
+            ts = None if ts_raw == "n/a" else ts_raw
+        else:
+            buf.append(line)
+    if buf:
+        yield num, ts, "\n".join(buf)
+
+
+class _RecordWriter:
+    """Writes reshaped records to an open text file in ``fmt`` (csv|jsonl). csv
+    emits a header row first (columns ``src,n,ts,text``); the ``num_key`` names
+    the jsonl number field (``"n"`` for line records, ``"packet"`` for pcap
+    blocks). The file must be opened with ``newline=""`` so csv controls its own
+    line terminator and jsonl's explicit ``\\n`` is not translated."""
+
+    def __init__(self, fh, fmt: str, num_key: str = "n") -> None:
+        self._fmt = fmt
+        self._fh = fh
+        self._num_key = num_key
+        if fmt == "csv":
+            self._csv = csv.writer(fh)
+            self._csv.writerow(["src", "n", "ts", "text"])
+
+    def write(self, src: str, num: int | None, ts: str | None, text: str) -> None:
+        if self._fmt == "csv":
+            self._csv.writerow([src, "" if num is None else num,
+                                "" if ts is None else ts, text])
+        else:
+            rec = {"src": src, self._num_key: num, "ts": ts, "text": text}
+            self._fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+def _reshape_text(text: str, src_rel: str, out_path: Path, fmt: str,
+                  *, per_packet: bool) -> None:
+    """Write ``text`` reshaped into records at ``out_path`` in ``fmt``. Per line
+    for plain/office/sqlite text; per packet for pcap derivatives."""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8", newline="") as fh:
+        w = _RecordWriter(fh, fmt, num_key="packet" if per_packet else "n")
+        if per_packet:
+            for num, ts, block in _iter_packet_blocks(text):
+                w.write(src_rel, num, ts, block)
+        else:
+            for n, line in enumerate(_iter_lines(text), 1):
+                w.write(src_rel, n, _extract_ts(line), line)
+
+
+class _StreamRecordWriter:
+    """Line-record writer for the streaming path: buffers only the incomplete
+    trailing line between commits (line-by-line shaping, never whole-file
+    buffering) and keeps a global 1-based line counter. Matches ``_iter_lines``:
+    a trailing newline yields no empty final record; a file not ending in a
+    newline emits its last partial line on :meth:`close`."""
+
+    def __init__(self, fh, fmt: str, src_rel: str) -> None:
+        self._w = _RecordWriter(fh, fmt, num_key="n")
+        self._src = src_rel
+        self._pending = ""
+        self._lineno = 0
+
+    def _emit(self, line: str) -> None:
+        if line.endswith("\r"):
+            line = line[:-1]
+        self._lineno += 1
+        self._w.write(self._src, self._lineno, _extract_ts(line), line)
+
+    def feed(self, text: str) -> None:
+        parts = (self._pending + text).split("\n")
+        self._pending = parts.pop()          # incomplete trailing line
+        for line in parts:
+            self._emit(line)
+
+    def close(self) -> None:
+        if self._pending != "":
+            self._emit(self._pending)
+        self._pending = ""
+
+
 def _stream_file(
     path: Path,
     out_path: Path | None,
@@ -236,6 +391,8 @@ def _stream_file(
     bytes_total: int,
     bytes_base: int,
     progress: ProgressCallback | None,
+    out_format: str = "text",
+    style: Callable[[Detector, str], str] | None = None,
 ) -> int:
     """Stream a single (already-confirmed-text) huge file in overlapping chunks.
 
@@ -255,11 +412,18 @@ def _stream_file(
     buf = ""
     bytes_done = 0
     fh = None
+    rec_writer: _StreamRecordWriter | None = None
     try:
         if write and out_path is not None:
             out_path.parent.mkdir(parents=True, exist_ok=True)
-            # newline="" preserves line endings exactly, like whole-file write.
-            fh = open(out_path, "w", encoding=enc, newline="")
+            if out_format == "text":
+                # newline="" preserves line endings exactly, like whole-file write.
+                fh = open(out_path, "w", encoding=enc, newline="")
+            else:
+                # Reshaped records are a fresh utf-8 csv/jsonl container; the
+                # source encoding is irrelevant to the record file itself.
+                fh = open(out_path, "w", encoding="utf-8", newline="")
+                rec_writer = _StreamRecordWriter(fh, out_format, rel)
         with open(path, "rb") as src_fh:
             while True:
                 block = src_fh.read(READ_BLOCK)
@@ -279,9 +443,11 @@ def _stream_file(
                     safe_end = len(buf) - OVERLAP
                     out_text, reps, consumed = tokenize_segment(
                         buf, detectors, amap, allowlist_cf, file=rel,
-                        safe_end=safe_end,
+                        safe_end=safe_end, style=style,
                     )
-                    if fh is not None:
+                    if rec_writer is not None:
+                        rec_writer.feed(out_text)
+                    elif fh is not None:
                         fh.write(out_text)
                     total_reps += len(reps)
                     # Guard the OVERLAP invariant: if nothing was consumed even
@@ -310,8 +476,12 @@ def _stream_file(
                 raise _UndecodableStream(str(e)) from e
             out_text, reps, _consumed = tokenize_segment(
                 buf, detectors, amap, allowlist_cf, file=rel, safe_end=len(buf),
+                style=style,
             )
-            if fh is not None:
+            if rec_writer is not None:
+                rec_writer.feed(out_text)
+                rec_writer.close()
+            elif fh is not None:
                 fh.write(out_text)
             total_reps += len(reps)
     except _UndecodableStream:
@@ -345,6 +515,8 @@ def process_tree(
     progress: ProgressCallback | None = None,
     post_pass: Callable[[str, str], tuple[str, int]] | None = None,
     extract: "ExtractConfig | None" = None,
+    out_format: str = "text",
+    style: Callable[[Detector, str], str] | None = None,
 ) -> RunStats:
     """Walk ``src``; tokenise text files into ``dst`` (when ``write``).
 
@@ -368,7 +540,24 @@ def process_tree(
     and runs on the already-stripped text, never on raw input. Streamed huge
     files SKIP the post-pass (a warning is emitted) because the streaming path
     commits incrementally; v1 leaves them regex-only.
+
+    ``out_format`` (``"text"`` | ``"csv"`` | ``"jsonl"``) re-shapes scrubbed TEXT
+    outputs at write time (plain files, streaming path, and pcap/office/sqlite
+    ``.txt`` derivatives) into per-line / per-packet records; ``"text"`` (default)
+    is exactly today's mirror behaviour. Structured (csv/json/jsonl) handler
+    outputs and repacked archives are never re-shaped. See
+    docs/plans/2026-07-05-llm-prep-mode-design.md decisions #4/#5. ``out_format``
+    only affects strip (``write``); scan reports as today.
+
+    ``style`` (optional ``(detector, value) -> alias_prefix`` callable, e.g.
+    :func:`engine.make_structured_style`) is threaded into every tokenize call —
+    the whole-file path, the ``_scrub`` closure handed to format handlers, and
+    the streaming path — so structured aliases are applied uniformly across
+    plain files, derivatives, and huge files. None (default) = opaque prefixes.
     """
+    if out_format not in OUT_FORMATS:
+        raise ValueError(
+            f"out_format must be one of {OUT_FORMATS}, got {out_format!r}")
     include = include or []
     exclude = exclude or []
     stats = RunStats()
@@ -457,7 +646,8 @@ def process_tree(
         """The closure handed to every format handler: run the run's detectors/
         amap/allowlist over ``text`` and return (scrubbed_text, count). Handlers
         never import the engine or touch the AliasMap directly."""
-        new_text, reps = tokenize(text, detectors, amap, allowlist_cf, file=chunk_rel)
+        new_text, reps = tokenize(text, detectors, amap, allowlist_cf,
+                                  file=chunk_rel, style=style)
         return new_text, len(reps)
 
     for path, rel, size in candidates:
@@ -496,11 +686,22 @@ def process_tree(
                     dir=str(dst), prefix=".piiscrub-stage-"))
             stage_out_path = (stage_dir / Path(rel).name) if stage_dir else None
             placement_error: OSError | None = None
+            outcome = None
             try:
                 try:
                     outcome = handler.process(path, rel, stage_out_path, _scrub,
                                               write=write, limits=handler_limits)
                 except ExtractError as e:
+                    if handler.name == "structured":
+                        # A structured source (.csv/.json/.jsonl) IS text: fail
+                        # open to the plain TEXT scrub path below — regex-on-
+                        # text is the correct degraded mode — never to
+                        # copy-through with raw PII. Re-raise to the outer
+                        # handler so the name-resolution/placement bookkeeping
+                        # is skipped; the stage dir (holding no placed output)
+                        # is discarded in ``finally``, preserving the
+                        # no-partial-derivative contract.
+                        raise
                     _copy_through(
                         rel, "binary",
                         f"{rel}: binary type, copied unprocessed (may contain PII)"
@@ -516,16 +717,36 @@ def process_tree(
                 # (case-insensitively) with a real source file or an earlier
                 # derivative is uniquified so neither file is lost and the manifest
                 # attributes each output to the right source. A repack keeps its
-                # own rel (equal to a source path, so it cannot collide).
-                out_rel = outcome.out_rel
-                if outcome.kind == "derivative":
-                    out_rel = _unique_out_rel(outcome.out_rel)
-                    if out_rel != outcome.out_rel:
+                # own rel (equal to a source path, so it cannot collide) — and so
+                # does an in-format derivative whose out_rel EQUALS its source rel
+                # (structured csv/json/jsonl): its only "collision" would be with
+                # itself in reserved_rels, and the source is not written when it
+                # is extracted.
+                # Out-format re-shaping applies only to scrubbed TEXT derivatives
+                # from pcap/office/sqlite (``.txt``). A pcap derivative groups per
+                # packet; office/sqlite per line. Office .xlsx (.csv derivative),
+                # the structured handler (in-format csv/json/jsonl), and archive
+                # repacks are all left exactly as the handler wrote them — no
+                # double-wrapping (design #4/#5).
+                reshape = (
+                    write and out_format != "text"
+                    and outcome.kind == "derivative"
+                    and handler.name in ("pcap", "office", "sqlite")
+                    and outcome.out_rel.endswith(".txt"))
+                desired_out_rel = (
+                    outcome.out_rel[:-len(".txt")] + "." + out_format
+                    if reshape else outcome.out_rel)
+
+                out_rel = desired_out_rel
+                if outcome.kind == "derivative" and out_rel != rel:
+                    out_rel = _unique_out_rel(desired_out_rel)
+                    if out_rel != desired_out_rel:
                         stats.warnings.append(
-                            f"{rel}: derivative {outcome.out_rel!r} collides with "
+                            f"{rel}: derivative {desired_out_rel!r} collides with "
                             f"an existing file; written as {out_rel!r} instead")
 
-                # Move the handler's single staged output onto the resolved path.
+                # Move the handler's single staged output onto the resolved path
+                # (or re-shape it there, for csv/jsonl text derivatives).
                 if stage_dir is not None and dst is not None:
                     produced = sorted(
                         p for p in stage_dir.rglob("*") if p.is_file())
@@ -533,7 +754,14 @@ def process_tree(
                         final = dst / out_rel
                         try:
                             final.parent.mkdir(parents=True, exist_ok=True)
-                            os.replace(produced[0], final)
+                            if reshape:
+                                staged_text = produced[0].read_text(
+                                    encoding="utf-8")
+                                _reshape_text(
+                                    staged_text, rel, final, out_format,
+                                    per_packet=(handler.name == "pcap"))
+                            else:
+                                os.replace(produced[0], final)
                         except OSError as e:
                             # e.g. ENAMETOOLONG on the resolved output name: fail
                             # OPEN to copy-through + flag (the staged file is
@@ -541,40 +769,55 @@ def process_tree(
                             placement_error = e
                 if placement_error is None and outcome.kind == "derivative":
                     claimed_out_rels.add(out_rel)
+            except ExtractError as e:
+                # Only the structured handler re-raises to here (see above):
+                # record the reason and drop into the plain text scrub path
+                # below for this file — these are text files, so the degraded
+                # mode is a normal regex-on-text scrub, never copy-through
+                # with raw PII.
+                outcome = None
+                stats.warnings.append(
+                    f"{rel}: structured parse failed; scrubbed as plain "
+                    f"text — {e}")
             finally:
                 if stage_dir is not None:
                     shutil.rmtree(stage_dir, ignore_errors=True)
 
-            if placement_error is not None:
-                _copy_through(
-                    rel, "binary",
-                    f"{rel}: binary type, copied unprocessed (may contain PII)"
-                    + _capture_export_hint(path.suffix)
-                    + f" — extraction skipped: could not place output: "
-                    f"{placement_error}",
-                )
+            if outcome is not None:
+                if placement_error is not None:
+                    _copy_through(
+                        rel, "binary",
+                        f"{rel}: binary type, copied unprocessed (may contain PII)"
+                        + _capture_export_hint(path.suffix)
+                        + f" — extraction skipped: could not place output: "
+                        f"{placement_error}",
+                    )
+                    files_done += 1
+                    bytes_done_total += size
+                    _emit(rel)
+                    continue
+
+                stats.extracted.append(ExtractRecord(
+                    rel=rel, out_rel=out_rel, kind=outcome.kind,
+                    replacements=outcome.replacements,
+                    members_processed=outcome.members_processed,
+                    members_copied=outcome.members_copied,
+                ))
+                stats.per_file.append(FileStat(
+                    rel, "extracted", replacements=outcome.replacements,
+                    out_rel=out_rel))
+                stats.files_extracted += 1
+                stats.replacements += outcome.replacements
+                for w in outcome.warnings:
+                    stats.warnings.append(f"{rel}: {w}")
                 files_done += 1
                 bytes_done_total += size
                 _emit(rel)
                 continue
-
-            stats.extracted.append(ExtractRecord(
-                rel=rel, out_rel=out_rel, kind=outcome.kind,
-                replacements=outcome.replacements,
-                members_processed=outcome.members_processed,
-                members_copied=outcome.members_copied,
-            ))
-            stats.per_file.append(FileStat(
-                rel, "extracted", replacements=outcome.replacements,
-                out_rel=out_rel))
-            stats.files_extracted += 1
-            stats.replacements += outcome.replacements
-            for w in outcome.warnings:
-                stats.warnings.append(f"{rel}: {w}")
-            files_done += 1
-            bytes_done_total += size
-            _emit(rel)
-            continue
+            # ``outcome is None``: the structured handler failed open. Fall
+            # through to the normal text path (.csv/.json/.jsonl are not in
+            # BINARY_EXTS and decode as text), which scrubs and writes
+            # ``dst/rel`` itself.
 
         if path.suffix.lower() in BINARY_EXTS:
             _copy_through(rel, "binary",
@@ -598,12 +841,21 @@ def process_tree(
                 bytes_done_total += size
                 _emit(rel)
                 continue
+            # Reshaped streaming output goes to a suffixed csv/jsonl name; the
+            # aliases produced are identical to a text-mode run (only the write
+            # shape differs). scan (write=False) writes nothing → no reshape.
+            stream_out_rel = rel
+            stream_out_path = out_path
+            if write and out_format != "text" and dst is not None:
+                stream_out_rel = _unique_out_rel(rel + "." + out_format)
+                claimed_out_rels.add(stream_out_rel)
+                stream_out_path = dst / stream_out_rel
             try:
                 n = _stream_file(
-                    path, out_path, rel, detectors, amap, allowlist_cf, enc, write,
-                    files_done=files_done, files_total=files_total,
+                    path, stream_out_path, rel, detectors, amap, allowlist_cf, enc,
+                    write, files_done=files_done, files_total=files_total,
                     bytes_total=bytes_total, bytes_base=bytes_done_total,
-                    progress=progress,
+                    progress=progress, out_format=out_format, style=style,
                 )
             except _UndecodableStream:
                 # FIX 1: invalid bytes appeared in a later block. _stream_file
@@ -626,6 +878,8 @@ def process_tree(
                     f"{rel}: streamed huge file; LLM second pass skipped (regex-only)"
                 )
             fs = FileStat(rel, "processed", encoding=enc, replacements=n)
+            if stream_out_rel != rel:
+                fs.out_rel = stream_out_rel
             stats.per_file.append(fs)
             stats.files_processed += 1
             stats.replacements += n
@@ -648,7 +902,8 @@ def process_tree(
             continue
 
         text, enc = decoded
-        new_text, reps = tokenize(text, detectors, amap, allowlist_cf, file=rel)
+        new_text, reps = tokenize(text, detectors, amap, allowlist_cf, file=rel,
+                                  style=style)
         rep_count = len(reps)
         # Optional second pass: runs on the ALREADY-STRIPPED text (``new_text``),
         # never on raw ``text``. Adds extra aliases via the shared amap.
@@ -656,13 +911,23 @@ def process_tree(
             new_text, extra = post_pass(rel, new_text)
             rep_count += extra
         fs = FileStat(rel, "processed", encoding=enc, replacements=rep_count)
+        if write and out_path is not None:
+            if out_format == "text":
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(out_path, "w", encoding=enc, newline="") as fh:
+                    fh.write(new_text)
+            else:
+                # Re-shape the scrubbed text into per-line csv/jsonl records under
+                # a suffixed name (x.log -> x.log.jsonl); the original mirror name
+                # is not written.
+                reshaped_rel = _unique_out_rel(rel + "." + out_format)
+                claimed_out_rels.add(reshaped_rel)
+                fs.out_rel = reshaped_rel
+                _reshape_text(new_text, rel, dst / reshaped_rel, out_format,
+                              per_packet=False)
         stats.per_file.append(fs)
         stats.files_processed += 1
         stats.replacements += rep_count
-        if write and out_path is not None:
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(out_path, "w", encoding=enc, newline="") as fh:
-                fh.write(new_text)
         files_done += 1
         bytes_done_total += size
         _emit(rel)

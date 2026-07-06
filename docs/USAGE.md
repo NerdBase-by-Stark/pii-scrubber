@@ -294,6 +294,7 @@ the shareable tree:
 | `book.xlsx` | `book.xlsx.csv` | one CSV line per row, `# sheet:` sections |
 | `data.db` / `.sqlite` / `.sqlite3` | `data.db.txt` | every user table dumped read-only; BLOBs as `<blob N bytes>` |
 | `logs.zip`, `logs.tar.gz`, `f.gz` … | same name, repacked | each member scrubbed by the same rules (recursively) |
+| `inventory.csv`, `data.json`, `events.jsonl` | same name, same format | **field-aware**: parsed, every string value scrubbed, keys/columns untouched — output stays valid CSV/JSON/JSON Lines |
 
 The **original binary is not copied** when a derivative is produced; the report's
 `extracted` section records the `src → out` mapping and member counts. Anything
@@ -321,7 +322,10 @@ piiscrub strip ./src ./out --extract-disable pcap
 
 An unknown extractor name (a typo like `pacp`, or `sqlite3` instead of `sqlite`)
 is rejected immediately rather than silently leaving extraction on. Valid names:
-`pcap`, `archive`, `office`, `sqlite`.
+`pcap`, `archive`, `office`, `sqlite`, `structured` (the last one is the
+csv/json/jsonl field-aware handler — see the table above). Disabling
+`structured` falls the file back to plain regex-on-text scrubbing, not
+copy-through — csv/json/jsonl are text, not binary.
 
 Equivalent `piiscrub.toml`:
 
@@ -422,6 +426,116 @@ member with the same map — the members are ordinary scrubbed text. A repacked
 
 ---
 
+## LLM-prep mode (`--alias-style`, `--out-format`, `--profile llm`)
+
+The flags below turn a mirror-format stripped tree into a **structure-preserving,
+LLM-ready** one: an LLM sees enough shape (same subnet, multicast vs unicast,
+one record per line/packet) to actually reason about a multi-source capture,
+while still never seeing a real value. See
+[How re-identification works](../README.md#how-re-identification-works) in the
+README before sending anything to a model.
+
+| Flag | Config key (top-level TOML) | Values | Default | Effect |
+|------|------------------------------|--------|---------|--------|
+| `--alias-style STYLE` | `alias_style` | `opaque` \| `structured` | `opaque` | `structured` mints new plain aliases as subnet/role-aware: `<IP_NET1_7>` (grouped by /24), `<IPV6_NET1_2>` (grouped by /64), `<MCAST_1>` / `<MCAST6_1>` (non-well-known multicast), `<IP_LL_1>` (169.254/16 link-local), `<MACMC_1>` (multicast MAC). Aliases already in a vault, and entity-scoped aliases, keep their existing form — style only affects **newly minted plain aliases**. |
+| `--out-format FORMAT` | `out_format` | `text` \| `csv` \| `jsonl` | `text` | Reshapes scrubbed **text** output (plain files, and `.txt` pcap/office/sqlite derivatives) into records: one per line (`{"src", "n", "ts", "text"}`) or, for pcap derivatives, one per packet (`{"src", "packet", "ts", "text"}`). `csv` writes the same fields as columns. Field-aware `.csv`/`.json`/`.jsonl` sources (the `structured` extractor) are already structured and are **not** re-wrapped — they keep their own in-format output. |
+| — | `keep_wellknown` | `true` \| `false` | `true` | Well-known/multicast addresses (`224.0.1.129` PTP, `224.0.0.251` mDNS, broadcast, …) are kept verbatim regardless of `--alias-style`; `keep_wellknown = false` tokenises them like any other address. No CLI flag — config-only. |
+
+`--profile llm` is shorthand for `--alias-style structured --out-format jsonl`
+(well-known addresses are kept verbatim either way — that's the default, not
+something the profile changes).
+
+```toml
+# piiscrub.toml — equivalent of --profile llm, spelled out
+alias_style    = "structured"
+out_format     = "jsonl"
+keep_wellknown = true            # default; set false to also tokenise 224.0.1.129 etc.
+```
+
+### Worked example — pcap + syslog + csv through `--profile llm`
+
+`./diagnostics` holds three sources that would normally be hard to correlate by
+eye: a packet capture, a syslog file, and a CSV asset export — all mentioning
+the same core switch by its IP, `192.0.2.10` (RFC 5737 `TEST-NET-1`):
+
+```text
+diagnostics/
+├── capture.pcap      # a PTPv2 Announce: 192.0.2.10 -> multicast 224.0.1.129
+├── device.syslog     # an SSH login on the same switch
+└── inventory.csv     # asset export: hostname, ip, site
+```
+
+`inventory.csv` (before):
+
+```csv
+hostname,ip,site
+sw-core01,192.0.2.10,HQ
+```
+
+`device.syslog` (before, one line):
+
+```text
+2026-07-05T09:12:04Z sw-core01 sshd[1200]: Accepted publickey for admin from 192.0.2.10 port 51000
+```
+
+Strip with the `llm` profile:
+
+```bash
+piiscrub strip ./diagnostics ./diagnostics-clean --profile llm
+```
+
+Resulting layout — the pcap and syslog derivatives are reshaped to `.jsonl`;
+`inventory.csv` keeps its own name and format (field-aware output is not
+re-wrapped):
+
+```text
+diagnostics-clean/
+├── capture.pcap.jsonl
+├── device.syslog.jsonl
+└── inventory.csv
+```
+
+`capture.pcap.jsonl` (one packet record — `224.0.1.129` is well-known PTP
+multicast and survives verbatim; the switch's own IP becomes a structured,
+subnet-grouped alias):
+
+```json
+{"src": "capture.pcap", "packet": 1, "ts": "2026-07-05T09:12:04.000000Z", "text": "# packet 1 ts=2026-07-05T09:12:04.000000Z caplen=96 origlen=96\neth <MAC_1> -> 01:00:5e:00:01:81 type=0x0800\nipv4 <IP_NET1_1> -> 224.0.1.129 proto=17 ttl=1\nudp 319 -> 319 len=44\nptp v2 announce dom=0 seq=1201 clockid mac=<MAC_1> eui64 port=1 prio1=128 prio2=128 gm mac=<MAC_1> eui64 steps=0 tsrc=0xa0 utcoff=0"}
+```
+
+`device.syslog.jsonl` (one line record — same `<IP_NET1_1>` as the pcap, so
+the two sources visibly correlate):
+
+```json
+{"src": "device.syslog", "n": 1, "ts": "2026-07-05T09:12:04Z", "text": "2026-07-05T09:12:04Z sw-core01 sshd[1200]: Accepted publickey for admin from <IP_NET1_1> port 51000"}
+```
+
+`inventory.csv` (after — still a plain CSV, same `<IP_NET1_1>` again):
+
+```csv
+hostname,ip,site
+sw-core01,<IP_NET1_1>,HQ
+```
+
+All three sources now say `<IP_NET1_1>` for the same switch — an LLM reading
+the three files together can tell it's one device without ever seeing
+`192.0.2.10`.
+
+To re-identify after the LLM responds, send it only the stripped files above
+(never the decode map), then run its answer back through `reverse` locally:
+
+```bash
+piiscrub reverse ./llm_report.txt ./llm_report.restored.txt \
+  --map ./diagnostics/_pii/decode.json
+```
+
+If the LLM's report contains `<IP_NET1_1>` verbatim (tell it up front to keep
+tokens like `<IP_NET1_1>` or `<MCAST_1>` intact rather than paraphrasing
+them), `reverse` puts `192.0.2.10` back in the restored copy — entirely on
+your machine.
+
+---
+
 ## Verifying an existing stripped tree
 
 You can re-run the fail-closed residual-PII check on any stripped tree at any
@@ -477,7 +591,7 @@ Release as the CLI exe on tag pushes.
 | Flag | Applies to | Purpose |
 |------|------------|---------|
 | `--config PATH` | scan, strip, verify | Load a `piiscrub.toml`. |
-| `--profile NAME` | scan, strip, verify | Apply a named preset (`generic`, `network-gear`, `syslog`, `windows-logs`, `pcap-text`). |
+| `--profile NAME` | scan, strip, verify | Apply a named preset (`generic`, `network-gear`, `syslog`, `windows-logs`, `pcap-text`, `llm`). |
 | `--project DIR` | scan, strip | Use a central cross-run vault. |
 | `--entities PATH` | scan, strip | Entity-table CSV (default `<project>/entities.csv`). |
 | `--emit-entities` | scan, strip | Write a starter entity CSV of detected identifiers. |
@@ -486,6 +600,8 @@ Release as the CLI exe on tag pushes.
 | `--max-bytes N` | scan, strip, verify | Copy files larger than `N` bytes through unprocessed. |
 | `--stream-threshold N` | scan, strip, verify | Stream files larger than `N` bytes (default 50 MB). |
 | `--no-extract` | scan, strip, verify | Disable binary-format extraction (pcap/archive/office/sqlite); restore copy-through + flag. On `verify`, also skips archive recursion. |
-| `--extract-disable NAME` | scan, strip, verify | Disable one extractor by name (`pcap`\|`archive`\|`office`\|`sqlite`); repeatable, also applied to archive members. |
+| `--extract-disable NAME` | scan, strip, verify | Disable one extractor by name (`pcap`\|`archive`\|`office`\|`sqlite`\|`structured`); repeatable, also applied to archive members. |
+| `--alias-style STYLE` | scan, strip | `opaque` (default) or `structured` — subnet/multicast-aware alias prefixes for newly minted plain aliases. |
+| `--out-format FORMAT` | scan, strip | `text` (default), `csv`, or `jsonl` — reshapes scrubbed text output into per-line/per-packet records. |
 | `--no-progress` | scan, strip, verify | Suppress the stderr progress bar. |
 | `--map PATH` | reverse | Decode map (`decode.json`) or vault `map.json`. |

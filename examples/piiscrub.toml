@@ -17,6 +17,23 @@ denylist = ["ProjectFalcon"]
 # Skip files larger than this many bytes (copied through + flagged). Default 200 MB.
 # max_bytes = 209715200
 
+# ---- LLM-prep output shaping (CLI: --alias-style / --out-format) ----
+# Alias grammar: "opaque" (default, <IP_1>) or "structured" (<IP_NET1_1>) which
+# keeps subnet grouping / multicast / link-local shape VISIBLE to an LLM while
+# every value stays reversible.
+# alias_style = "opaque"
+# Output shape: "text" (default mirror), "csv", or "jsonl" (per-line / per-packet
+# records for LLM ingestion; x.log -> x.log.jsonl, cap.pcap -> cap.pcap.jsonl).
+# out_format = "text"
+# Keep well-known addresses (loopback, broadcast, standard multicast + PTP
+# groups) VERBATIM — they are identical on every network and identify nothing.
+# Set false to tokenise them too (strip and verify stay consistent either way).
+# keep_wellknown = true
+#
+# Shortcut: the built-in "llm" profile bundles structured aliases + jsonl output
+# (well-knowns already kept by default):
+#   piiscrub strip ./extracted ./clean --profile llm
+
 [detectors]
 # Turn built-in categories off (they are on by default):
 disable = []          # e.g. ["credit_card", "fqdn"]
