@@ -28,7 +28,7 @@ concurrency:
 jobs:
   build:
     runs-on: windows-latest
-    timeout-minutes: 6       # ~3x the slowest recent run (1.8 min)
+    timeout-minutes: 10      # ~3x the slowest run in full history (3.0 min, cold cache)
 
     steps:
       - name: Checkout
