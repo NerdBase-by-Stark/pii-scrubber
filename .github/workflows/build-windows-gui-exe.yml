@@ -10,8 +10,8 @@ name: Build piiscrub-gui (Windows EXE)
 #   The CLI workflow (build-windows-exe.yml) calls `gh release create` on tag
 #   pushes.  This GUI workflow deliberately does NOT call `gh release create`
 #   (that would race or fail if the release already exists).  Instead it calls
-#   `gh release upload --clobber` with a short retry loop so it attaches the
-#   GUI exe to whichever workflow finishes first.
+#   `gh release upload --clobber` with a capped retry loop (exponential
+#   backoff) so it attaches the GUI exe to whichever workflow finishes first.
 
 on:
   workflow_dispatch:
@@ -25,11 +25,14 @@ permissions:
 
 concurrency:
   group: build-piiscrub-gui-${{ github.ref }}
-  cancel-in-progress: true
+  # Cancel superseded branch builds, but never a tag run: it attaches the exe
+  # to the Release, and a half-finished publish is worse than a queued one.
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
 
 jobs:
   build:
     runs-on: windows-latest
+    timeout-minutes: 10      # ~3x the slowest recent run (3.1 min)
 
     steps:
       - name: Checkout
@@ -108,9 +111,14 @@ jobs:
             if ($LASTEXITCODE -eq 0) {
               $uploaded = $true
               Write-Host "Upload succeeded on attempt $attempt."
+            } elseif ($attempt -lt $maxAttempts) {
+              # Exponential backoff (5, 10, 20, 40 s) so a slow CLI build or a
+              # rate-limited API is not hammered; no sleep after the last try.
+              $delay = 5 * [math]::Pow(2, $attempt - 1)
+              Write-Host "Upload failed (exit $LASTEXITCODE). Waiting $delay s before retry …"
+              Start-Sleep -Seconds $delay
             } else {
-              Write-Host "Upload failed (exit $LASTEXITCODE). Waiting 15 s before retry …"
-              Start-Sleep -Seconds 15
+              Write-Host "Upload failed (exit $LASTEXITCODE) on the final attempt."
             }
           }
           if (-not $uploaded) {

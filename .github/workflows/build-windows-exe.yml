@@ -21,11 +21,14 @@ permissions:
 
 concurrency:
   group: build-piiscrub-${{ github.ref }}
-  cancel-in-progress: true
+  # Cancel superseded branch builds, but never a tag run: it publishes the
+  # Release, and a half-finished publish is worse than a queued one.
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
 
 jobs:
   build:
     runs-on: windows-latest
+    timeout-minutes: 10      # ~3x the slowest run in full history (3.0 min, cold cache)
 
     steps:
       - name: Checkout
